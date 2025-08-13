@@ -516,7 +516,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
     import statistics
     
     if timeframe == "5min":
-        # Get intraday 5-minute data for today with Taiwan timezone
+        # Get intraday 1-minute data for today with Taiwan timezone
         now_tw = datetime.now(TW_TZ)
         today = now_tw.date()
         
@@ -529,8 +529,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 contract=contract,
                 start=start_time.strftime('%Y-%m-%d'),
                 end=end_time.strftime('%Y-%m-%d'),
-                timeout=30000,
-                timeframe='5T'  # 5-minute timeframe (T = minutes in pandas notation)
+                timeout=30000
             )
             
             if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
@@ -552,6 +551,24 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 
                 if df.empty:
                     return {"success": False, "message": f"No intraday data available for {stock_code}"}
+                
+                # Set timestamp as index for resampling
+                df.set_index('ts', inplace=True)
+                
+                # Resample to 5-minute bars
+                df_5min = df.resample('5T', label='right', closed='right').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).dropna()
+                
+                # Reset index to get timestamp back as column
+                df_5min.reset_index(inplace=True)
+                
+                if df_5min.empty:
+                    return {"success": False, "message": f"Could not create 5-minute bars for {stock_code}"}
                 
                 try:
                     # Get tick data for buy/sell volume calculation
@@ -578,11 +595,10 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     logger.warning(f"Could not get tick data for {stock_code}: {tick_error}")
                     tick_df = None
                 
-                # Process actual data from Shioaji
                 intraday_data = []
                 total_volume_today = 0
                 
-                for _, row in df.iterrows():
+                for _, row in df_5min.iterrows():
                     # Calculate average price (OHLC average)
                     open_price = float(row['Open'])
                     high_price = float(row['High'])
@@ -597,12 +613,12 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     
                     if tick_df is not None:
                         # Find ticks within this 5-minute interval
-                        interval_start = row['ts']
-                        interval_end = interval_start + pd.Timedelta(minutes=5)
+                        interval_start = row['ts'] - pd.Timedelta(minutes=5)
+                        interval_end = row['ts']
                         
                         interval_ticks = tick_df[
-                            (tick_df['ts'] >= interval_start) & 
-                            (tick_df['ts'] < interval_end)
+                            (tick_df['ts'] > interval_start) & 
+                            (tick_df['ts'] <= interval_end)
                         ]
                         
                         if not interval_ticks.empty:
@@ -625,14 +641,14 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         "close": close_price,
                         "average_price": round(avg_price, 2),
                         "volume": volume,
-                        "buy_volume": buy_volume,  # Now calculated from tick data
-                        "sell_volume": sell_volume  # Now calculated from tick data
+                        "buy_volume": buy_volume,
+                        "sell_volume": sell_volume
                     }
                     intraday_data.append(bar_data)
                     total_volume_today += volume
                 
                 if not intraday_data:
-                    return {"success": False, "message": f"Could not process intraday data for {stock_code}"}
+                    return {"success": False, "message": f"Could not process 5-minute data for {stock_code}"}
                 
                 # Sort by time to ensure proper order
                 intraday_data.sort(key=lambda x: x["time"])
@@ -663,20 +679,21 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 
                 return {
                     "success": True,
-                    "current_time": now_tw.strftime('%H:%M'),  # Now shows correct Taiwan time
+                    "current_time": now_tw.strftime('%H:%M'),
                     "current_date": now_tw.strftime('%Y-%m-%d'),
                     "target_time_data": target_bar,
                     "today_total_volume": total_volume_today,
-                    "intraday_bars": intraday_data,  # ALL actual 5-minute bars from Shioaji
+                    "intraday_bars": intraday_data,  # All 5-minute bars aggregated from 1-minute data
                     "total_bars_today": len(intraday_data),
                     "market_status": "open" if 9 <= current_hour < 13 or (current_hour == 13 and current_minute <= 30) else "closed",
                     "timezone": "Asia/Taipei (+8)",
                     "data_range": f"{intraday_data[0]['time']} - {intraday_data[-1]['time']}" if intraday_data else "No data",
-                    "buy_sell_data_available": tick_df is not None
+                    "buy_sell_data_available": tick_df is not None,
+                    "aggregation_method": "1min -> 5min resampling"
                 }
                 
             except Exception as df_error:
-                logger.error(f"Error converting kbars to DataFrame for {stock_code}: {df_error}")
+                logger.error(f"Error processing 5-minute data for {stock_code}: {df_error}")
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
         except Exception as e:
