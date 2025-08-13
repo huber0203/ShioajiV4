@@ -587,11 +587,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                             'volume': ticks.volume
                         }
                         
-                        # Add official buy/sell volume attributes if available
-                        if hasattr(ticks, 'bid_side_total_vol') and ticks.bid_side_total_vol:
-                            tick_data['bid_side_total_vol'] = ticks.bid_side_total_vol
-                        if hasattr(ticks, 'ask_side_total_vol') and ticks.ask_side_total_vol:
-                            tick_data['ask_side_total_vol'] = ticks.ask_side_total_vol
                         if hasattr(ticks, 'tick_type') and ticks.tick_type:
                             tick_data['tick_type'] = ticks.tick_type
                         
@@ -635,49 +630,51 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         ]
                         
                         if not interval_ticks.empty:
-                            if 'bid_side_total_vol' in interval_ticks.columns and 'ask_side_total_vol' in interval_ticks.columns:
-                                # Use official buy/sell volume totals from the last tick in the interval
-                                last_tick = interval_ticks.iloc[-1]
-                                buy_volume = int(last_tick['bid_side_total_vol']) if pd.notna(last_tick['bid_side_total_vol']) else None
-                                sell_volume = int(last_tick['ask_side_total_vol']) if pd.notna(last_tick['ask_side_total_vol']) else None
-                                
-                                # If we have previous interval data, calculate the difference
-                                if len(intraday_data) > 0:
-                                    prev_buy = intraday_data[-1].get('buy_volume_cumulative', 0) or 0
-                                    prev_sell = intraday_data[-1].get('sell_volume_cumulative', 0) or 0
-                                    
-                                    # Calculate interval buy/sell volume as difference from cumulative
-                                    interval_buy = max(0, buy_volume - prev_buy) if buy_volume else None
-                                    interval_sell = max(0, sell_volume - prev_sell) if sell_volume else None
-                                    
-                                    buy_volume = interval_buy
-                                    sell_volume = interval_sell
-                                
-                            elif 'tick_type' in interval_ticks.columns:
-                                # Fallback: Use tick_type classification (1=buy, 2=sell, 0=neutral)
+                            if 'tick_type' in interval_ticks.columns:
+                                # Use tick_type for actual executed volume classification
+                                # tick_type: 1=外盤(買進), 2=內盤(賣出), 0=無法判定
                                 buy_ticks = interval_ticks[interval_ticks['tick_type'] == 1]
                                 sell_ticks = interval_ticks[interval_ticks['tick_type'] == 2]
+                                neutral_ticks = interval_ticks[interval_ticks['tick_type'] == 0]
                                 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                                neutral_volume = int(neutral_ticks['volume'].sum()) if not neutral_ticks.empty else 0
+                                
+                                # Distribute neutral volume proportionally
+                                if neutral_volume > 0 and (buy_volume + sell_volume) > 0:
+                                    total_classified = buy_volume + sell_volume
+                                    buy_ratio = buy_volume / total_classified
+                                    sell_ratio = sell_volume / total_classified
+                                    
+                                    buy_volume += int(neutral_volume * buy_ratio)
+                                    sell_volume += int(neutral_volume * sell_ratio)
+                                elif neutral_volume > 0:
+                                    # If no classified volume, split neutral 50/50
+                                    buy_volume = neutral_volume // 2
+                                    sell_volume = neutral_volume - buy_volume
+                                
+                                logger.info(f"Interval {row['ts'].strftime('%H:%M')}: Buy={buy_volume}, Sell={sell_volume}, Neutral={neutral_volume}")
                                 
                             else:
-                                # Simple heuristic: compare with interval average price
+                                # Fallback: Use price comparison for buy/sell classification
                                 interval_avg = (open_price + close_price) / 2
                                 buy_ticks = interval_ticks[interval_ticks['close'] >= interval_avg]
                                 sell_ticks = interval_ticks[interval_ticks['close'] < interval_avg]
                                 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                                
+                                logger.info(f"Interval {row['ts'].strftime('%H:%M')} (price method): Buy={buy_volume}, Sell={sell_volume}")
                             
-                            # Ensure buy + sell doesn't exceed total volume (for non-cumulative data)
-                            if buy_volume is not None and sell_volume is not None:
-                                total_tick_volume = buy_volume + sell_volume
-                                if total_tick_volume > volume and total_tick_volume > 0:
-                                    # Proportionally adjust if tick volume exceeds K-bar volume
-                                    ratio = volume / total_tick_volume
-                                    buy_volume = int(buy_volume * ratio)
-                                    sell_volume = int(sell_volume * ratio)
+                            # Ensure buy + sell doesn't exceed K-bar volume
+                            total_tick_volume = buy_volume + sell_volume
+                            if total_tick_volume > volume and total_tick_volume > 0:
+                                # Proportionally adjust if tick volume exceeds K-bar volume
+                                ratio = volume / total_tick_volume
+                                buy_volume = int(buy_volume * ratio)
+                                sell_volume = int(sell_volume * ratio)
+                                logger.info(f"Adjusted volumes for {row['ts'].strftime('%H:%M')}: Buy={buy_volume}, Sell={sell_volume}")
                     
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
@@ -690,19 +687,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         "buy_volume": buy_volume,
                         "sell_volume": sell_volume
                     }
-                    
-                    if tick_df is not None and not tick_df.empty:
-                        interval_start = row['ts'] - pd.Timedelta(minutes=5)
-                        interval_end = row['ts']
-                        interval_ticks = tick_df[
-                            (tick_df['ts'] > interval_start) & 
-                            (tick_df['ts'] <= interval_end)
-                        ]
-                        
-                        if not interval_ticks.empty and 'bid_side_total_vol' in interval_ticks.columns:
-                            last_tick = interval_ticks.iloc[-1]
-                            bar_data['buy_volume_cumulative'] = int(last_tick['bid_side_total_vol']) if pd.notna(last_tick['bid_side_total_vol']) else 0
-                            bar_data['sell_volume_cumulative'] = int(last_tick['ask_side_total_vol']) if pd.notna(last_tick['ask_side_total_vol']) else 0
                     
                     intraday_data.append(bar_data)
                     total_volume_today += volume
