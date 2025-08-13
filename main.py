@@ -65,42 +65,56 @@ async def startup_event():
             logger.info(f"API Key first 4 chars: {api_key[:4]}...")
             logger.info(f"Secret Key first 4 chars: {secret_key[:4]}...")
             
-            # Check for problematic characters
-            problematic_chars = ['$', '"', "'", '\\', '\n', '\r', '\t']
-            api_key_issues = [char for char in problematic_chars if char in api_key]
-            secret_key_issues = [char for char in problematic_chars if char in secret_key]
-            
-            if api_key_issues:
-                logger.warning(f"API Key contains problematic characters: {api_key_issues}")
-            if secret_key_issues:
-                logger.warning(f"Secret Key contains problematic characters: {secret_key_issues}")
-            
-            # Clean the environment variables
             api_key_clean = api_key.strip().strip('"').strip("'")
             secret_key_clean = secret_key.strip().strip('"').strip("'")
             
             if api_key_clean != api_key:
-                logger.info("API Key was cleaned (removed quotes/whitespace)")
+                logger.info("API Key was cleaned (removed quotes/whitespace only)")
             if secret_key_clean != secret_key:
-                logger.info("Secret Key was cleaned (removed quotes/whitespace)")
+                logger.info("Secret Key was cleaned (removed quotes/whitespace only)")
+            
+            logger.info(f"Cleaned API Key length: {len(api_key_clean)}")
+            logger.info(f"Cleaned Secret Key length: {len(secret_key_clean)}")
+            logger.info(f"Cleaned API Key first 4 chars: {api_key_clean[:4]}...")
+            logger.info(f"Cleaned Secret Key first 4 chars: {secret_key_clean[:4]}...")
             
             try:
                 logger.info("Attempting auto-login with environment variables...")
-                accounts = api.login(
-                    api_key=api_key_clean,
-                    secret_key=secret_key_clean,
-                    fetch_contract=True,
-                    subscribe_trade=True
-                )
+                login_attempts = [
+                    # First try: original cleaned keys
+                    (api_key_clean, secret_key_clean, "original"),
+                    # Second try: URL encoded keys
+                    (api_key_clean.encode('utf-8').decode('unicode_escape'), 
+                     secret_key_clean.encode('utf-8').decode('unicode_escape'), "unicode_escape"),
+                ]
                 
-                if accounts:
-                    login_status = True
-                    logger.info(f"Auto-login successful! Connected accounts: {[acc.account_id for acc in accounts]}")
-                    logger.info(f"Stock account: {api.stock_account}")
-                    logger.info(f"Future account: {api.futopt_account}")
-                else:
+                login_successful = False
+                for api_key_attempt, secret_key_attempt, method in login_attempts:
+                    try:
+                        logger.info(f"Trying login method: {method}")
+                        accounts = api.login(
+                            api_key=api_key_attempt,
+                            secret_key=secret_key_attempt,
+                            fetch_contract=True,
+                            subscribe_trade=True
+                        )
+                        
+                        if accounts:
+                            login_status = True
+                            login_successful = True
+                            logger.info(f"Auto-login successful with method: {method}")
+                            logger.info(f"Connected accounts: {[acc.account_id for acc in accounts]}")
+                            logger.info(f"Stock account: {api.stock_account}")
+                            logger.info(f"Future account: {api.futopt_account}")
+                            break
+                            
+                    except Exception as attempt_error:
+                        logger.warning(f"Login attempt with {method} failed: {attempt_error}")
+                        continue
+                
+                if not login_successful:
                     login_status = False
-                    logger.error("Auto-login failed: No accounts returned")
+                    logger.error("All auto-login attempts failed")
                     
             except Exception as e:
                 login_status = False
@@ -398,43 +412,47 @@ async def retry_auto_login():
         logger.info(f"Retry - API Key length: {len(api_key)}")
         logger.info(f"Retry - Secret Key length: {len(secret_key)}")
         
-        # Clean the environment variables
         api_key_clean = api_key.strip().strip('"').strip("'")
         secret_key_clean = secret_key.strip().strip('"').strip("'")
         
-        try:
-            logger.info("Retrying auto-login...")
-            accounts = api.login(
-                api_key=api_key_clean,
-                secret_key=secret_key_clean,
-                fetch_contract=True,
-                subscribe_trade=True
-            )
-            
-            if accounts:
-                login_status = True
-                return {
-                    "success": True,
-                    "message": "Auto-login retry successful",
-                    "accounts": [acc.account_id for acc in accounts],
-                    "stock_account": api.stock_account.account_id if api.stock_account else None,
-                    "futopt_account": api.futopt_account.account_id if api.futopt_account else None
-                }
-            else:
-                login_status = False
-                return {
-                    "success": False,
-                    "message": "Login retry failed: No accounts returned"
-                }
+        logger.info(f"Retry - Cleaned API Key length: {len(api_key_clean)}")
+        logger.info(f"Retry - Cleaned Secret Key length: {len(secret_key_clean)}")
+        
+        login_attempts = [
+            (api_key_clean, secret_key_clean, "original"),
+            (api_key_clean.encode('utf-8').decode('unicode_escape'), 
+             secret_key_clean.encode('utf-8').decode('unicode_escape'), "unicode_escape"),
+        ]
+        
+        for api_key_attempt, secret_key_attempt, method in login_attempts:
+            try:
+                logger.info(f"Retrying login with method: {method}")
+                accounts = api.login(
+                    api_key=api_key_attempt,
+                    secret_key=secret_key_attempt,
+                    fetch_contract=True,
+                    subscribe_trade=True
+                )
                 
-        except Exception as e:
-            login_status = False
-            logger.error(f"Login retry error: {e}")
-            return {
-                "success": False,
-                "message": f"Login retry failed: {str(e)}",
-                "error_type": type(e).__name__
-            }
+                if accounts:
+                    login_status = True
+                    return {
+                        "success": True,
+                        "message": f"Auto-login retry successful with method: {method}",
+                        "accounts": [acc.account_id for acc in accounts],
+                        "stock_account": api.stock_account.account_id if api.stock_account else None,
+                        "futopt_account": api.futopt_account.account_id if api.futopt_account else None
+                    }
+                    
+            except Exception as e:
+                logger.warning(f"Login retry with {method} failed: {e}")
+                continue
+        
+        login_status = False
+        return {
+            "success": False,
+            "message": "All login retry attempts failed"
+        }
             
     except Exception as e:
         return {
