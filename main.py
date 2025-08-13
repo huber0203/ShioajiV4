@@ -1,5 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import shioaji as sj
 import os
@@ -17,7 +16,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-security = HTTPBearer()
 
 # Global Shioaji API instance
 api = None
@@ -27,7 +25,6 @@ login_status = False
 class LoginRequest(BaseModel):
     api_key: str
     secret_key: str
-    person_id: Optional[str] = None
 
 class OrderRequest(BaseModel):
     action: str  # "Buy" or "Sell"
@@ -79,18 +76,15 @@ async def startup_event():
             except Exception as e:
                 login_status = False
                 logger.error(f"Auto-login error: {e}")
-                # Don't raise the exception - let the service start anyway
         else:
             login_status = False
-            logger.warning("Auto-login skipped: Missing SHIOAJI_API_KEY or SHIOAJI_SECRET_KEY environment variables")
+            logger.warning("Auto-login skipped: Missing environment variables")
             
     except Exception as e:
         logger.error(f"Startup error: {e}")
-        # Initialize api as None if there's an error, but don't crash the service
         api = None
         login_status = False
 
-# Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     global api, login_status
@@ -117,6 +111,9 @@ async def login(request: LoginRequest):
     """Manual login to Shioaji API (optional if auto-login is configured)"""
     global api, login_status
     try:
+        if not api:
+            api = sj.Shioaji()
+            
         accounts = api.login(
             api_key=request.api_key,
             secret_key=request.secret_key,
@@ -126,7 +123,6 @@ async def login(request: LoginRequest):
         
         if accounts:
             login_status = True
-            # Get account info
             account_info = {
                 "accounts": [
                     {
@@ -155,7 +151,10 @@ async def login(request: LoginRequest):
             
     except Exception as e:
         logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return LoginResponse(
+            success=False,
+            message=f"Login failed: {str(e)}"
+        )
 
 @app.post("/logout")
 async def logout():
@@ -170,7 +169,7 @@ async def logout():
             return {"success": False, "message": "Not logged in"}
     except Exception as e:
         logger.error(f"Logout error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"success": False, "message": f"Logout failed: {str(e)}"}
 
 @app.get("/accounts")
 async def get_accounts():
@@ -178,7 +177,7 @@ async def get_accounts():
     global api
     try:
         if not api or not login_status:
-            raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
+            return {"success": False, "message": "Not logged in - please check environment variables"}
         
         accounts = api.list_accounts()
         return {
@@ -199,7 +198,7 @@ async def get_accounts():
         }
     except Exception as e:
         logger.error(f"Get accounts error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"success": False, "message": f"Error: {str(e)}"}
 
 @app.get("/positions")
 async def get_positions():
@@ -207,7 +206,7 @@ async def get_positions():
     global api
     try:
         if not api or not login_status:
-            raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
+            return {"success": False, "message": "Not logged in - please check environment variables"}
         
         positions = api.list_positions()
         return {
@@ -225,7 +224,7 @@ async def get_positions():
         }
     except Exception as e:
         logger.error(f"Get positions error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"success": False, "message": f"Error: {str(e)}"}
 
 @app.post("/order", response_model=OrderResponse)
 async def place_order(request: OrderRequest):
@@ -233,15 +232,30 @@ async def place_order(request: OrderRequest):
     global api
     try:
         if not api or not login_status:
-            raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
+            return OrderResponse(
+                success=False,
+                message="Not logged in - please check environment variables"
+            )
+        
+        if request.action not in ["Buy", "Sell"]:
+            return OrderResponse(
+                success=False,
+                message="Invalid action. Must be 'Buy' or 'Sell'"
+            )
         
         # Get contract
         contract = api.Contracts.Stocks.get(request.code)
         if not contract:
-            raise HTTPException(status_code=404, detail=f"Stock {request.code} not found")
+            return OrderResponse(
+                success=False,
+                message=f"Stock {request.code} not found"
+            )
         
         if not api.stock_account:
-            raise HTTPException(status_code=400, detail="No stock account available")
+            return OrderResponse(
+                success=False,
+                message="No stock account available"
+            )
         
         # Create order with proper constants
         order = api.Order(
@@ -265,7 +279,10 @@ async def place_order(request: OrderRequest):
         
     except Exception as e:
         logger.error(f"Place order error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return OrderResponse(
+            success=False,
+            message=f"Order failed: {str(e)}"
+        )
 
 @app.get("/quote/{stock_code}")
 async def get_quote(stock_code: str):
@@ -273,32 +290,42 @@ async def get_quote(stock_code: str):
     global api
     try:
         if not api or not login_status:
-            raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
+            return {"success": False, "message": "Not logged in - please check environment variables"}
         
         # Get contract
         contract = api.Contracts.Stocks.get(stock_code)
         if not contract:
-            raise HTTPException(status_code=404, detail=f"Stock {stock_code} not found")
+            return {"success": False, "message": f"Stock {stock_code} not found"}
         
-        # Get quote
-        quote = api.quote.get_quote(contract)
+        try:
+            # Try to get snapshots first (more reliable)
+            snapshots = api.snapshots([contract])
+            if snapshots and len(snapshots) > 0:
+                quote = snapshots[0]
+                return {
+                    "success": True,
+                    "code": stock_code,
+                    "name": contract.name,
+                    "price": quote.close,
+                    "volume": quote.volume,
+                    "high": quote.high,
+                    "low": quote.low,
+                    "open": quote.open
+                }
+        except:
+            pass
         
+        # Fallback to basic contract info
         return {
             "success": True,
             "code": stock_code,
             "name": contract.name,
-            "price": quote.get('Close', 0),
-            "change": quote.get('Change', 0),
-            "change_percent": quote.get('ChangePercent', 0),
-            "volume": quote.get('Volume', 0),
-            "high": quote.get('High', 0),
-            "low": quote.get('Low', 0),
-            "open": quote.get('Open', 0)
+            "message": "Quote data not available, showing contract info only"
         }
         
     except Exception as e:
         logger.error(f"Get quote error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"success": False, "message": f"Error: {str(e)}"}
 
 @app.get("/health")
 async def health_check():
@@ -312,4 +339,5 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
