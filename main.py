@@ -54,6 +54,11 @@ async def startup_event():
         api_key = os.getenv("SHIOAJI_API_KEY")
         secret_key = os.getenv("SHIOAJI_SECRET_KEY")
         
+        logger.info(f"Environment variables check:")
+        logger.info(f"SHIOAJI_API_KEY: {'SET' if api_key else 'NOT SET'}")
+        logger.info(f"SHIOAJI_SECRET_KEY: {'SET' if secret_key else 'NOT SET'}")
+        logger.info(f"SHIOAJI_PERSON_ID: {'SET' if os.getenv('SHIOAJI_PERSON_ID') else 'NOT SET'}")
+        
         if api_key and secret_key:
             try:
                 logger.info("Attempting auto-login with environment variables...")
@@ -76,6 +81,8 @@ async def startup_event():
             except Exception as e:
                 login_status = False
                 logger.error(f"Auto-login error: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                logger.error(f"Error details: {str(e)}")
         else:
             login_status = False
             logger.warning("Auto-login skipped: Missing environment variables")
@@ -103,7 +110,12 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "connected": login_status,
-        "auto_login": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY"))
+        "auto_login": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
+        "env_status": {
+            "SHIOAJI_API_KEY": "SET" if os.getenv("SHIOAJI_API_KEY") else "NOT SET",
+            "SHIOAJI_SECRET_KEY": "SET" if os.getenv("SHIOAJI_SECRET_KEY") else "NOT SET",
+            "SHIOAJI_PERSON_ID": "SET" if os.getenv("SHIOAJI_PERSON_ID") else "NOT SET"
+        }
     }
 
 @app.post("/login", response_model=LoginResponse)
@@ -336,6 +348,68 @@ async def health_check():
         "auto_login_configured": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
         "timestamp": str(datetime.now())
     }
+
+@app.post("/retry-login")
+async def retry_auto_login():
+    """Retry auto-login using environment variables"""
+    global api, login_status
+    try:
+        if not api:
+            api = sj.Shioaji()
+            
+        api_key = os.getenv("SHIOAJI_API_KEY")
+        secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+        
+        if not api_key or not secret_key:
+            return {
+                "success": False,
+                "message": "Environment variables not set",
+                "env_check": {
+                    "SHIOAJI_API_KEY": "SET" if api_key else "NOT SET",
+                    "SHIOAJI_SECRET_KEY": "SET" if secret_key else "NOT SET",
+                    "SHIOAJI_PERSON_ID": "SET" if os.getenv("SHIOAJI_PERSON_ID") else "NOT SET"
+                }
+            }
+        
+        try:
+            logger.info("Retrying auto-login...")
+            accounts = api.login(
+                api_key=api_key,
+                secret_key=secret_key,
+                fetch_contract=True,
+                subscribe_trade=True
+            )
+            
+            if accounts:
+                login_status = True
+                return {
+                    "success": True,
+                    "message": "Auto-login retry successful",
+                    "accounts": [acc.account_id for acc in accounts],
+                    "stock_account": api.stock_account.account_id if api.stock_account else None,
+                    "futopt_account": api.futopt_account.account_id if api.futopt_account else None
+                }
+            else:
+                login_status = False
+                return {
+                    "success": False,
+                    "message": "Login retry failed: No accounts returned"
+                }
+                
+        except Exception as e:
+            login_status = False
+            logger.error(f"Login retry error: {e}")
+            return {
+                "success": False,
+                "message": f"Login retry failed: {str(e)}",
+                "error_type": type(e).__name__
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Retry login error: {str(e)}"
+        }
 
 if __name__ == "__main__":
     import uvicorn
