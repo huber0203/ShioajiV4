@@ -5,6 +5,7 @@ import shioaji as sj
 import os
 from typing import Optional, Dict, Any
 import logging
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,7 @@ security = HTTPBearer()
 
 # Global Shioaji API instance
 api = None
+login_status = False
 
 # Pydantic models
 class LoginRequest(BaseModel):
@@ -46,43 +48,56 @@ class OrderResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global api
-    api = sj.Shioaji()
-    logger.info("Shioaji API initialized")
-    
-    # Auto-login using environment variables
-    api_key = os.getenv("SHIOAJI_API_KEY")
-    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-    person_id = os.getenv("SHIOAJI_PERSON_ID")
-    
-    if api_key and secret_key:
-        try:
-            logger.info("Attempting auto-login with environment variables...")
-            result = api.login(
-                api_key=api_key,
-                secret_key=secret_key,
-                person_id=person_id
-            )
-            
-            if result:
-                accounts = api.list_accounts()
-                logger.info(f"Auto-login successful! Connected accounts: {[acc.account_id for acc in accounts]}")
-            else:
-                logger.error("Auto-login failed: Invalid credentials")
+    global api, login_status
+    try:
+        api = sj.Shioaji()
+        logger.info("Shioaji API initialized")
+        
+        # Auto-login using environment variables
+        api_key = os.getenv("SHIOAJI_API_KEY")
+        secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+        person_id = os.getenv("SHIOAJI_PERSON_ID")
+        
+        if api_key and secret_key:
+            try:
+                logger.info("Attempting auto-login with environment variables...")
+                result = api.login(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    person_id=person_id
+                )
                 
-        except Exception as e:
-            logger.error(f"Auto-login error: {e}")
-    else:
-        logger.warning("Auto-login skipped: Missing SHIOAJI_API_KEY or SHIOAJI_SECRET_KEY environment variables")
+                if result:
+                    login_status = True
+                    accounts = api.list_accounts()
+                    logger.info(f"Auto-login successful! Connected accounts: {[acc.account_id for acc in accounts]}")
+                else:
+                    login_status = False
+                    logger.error("Auto-login failed: Invalid credentials")
+                    
+            except Exception as e:
+                login_status = False
+                logger.error(f"Auto-login error: {e}")
+                # Don't raise the exception - let the service start anyway
+        else:
+            login_status = False
+            logger.warning("Auto-login skipped: Missing SHIOAJI_API_KEY or SHIOAJI_SECRET_KEY environment variables")
+            
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+        # Initialize api as None if there's an error, but don't crash the service
+        api = None
+        login_status = False
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     global api
-    if api and api.login:
+    if api:
         try:
-            api.logout()
-            logger.info("Logged out from Shioaji API")
+            if hasattr(api, 'login') and api.login:
+                api.logout()
+                logger.info("Logged out from Shioaji API")
         except Exception as e:
             logger.error(f"Error during logout: {e}")
 
@@ -92,14 +107,14 @@ async def root():
         "message": "Shioaji Trading API with Auto-Login",
         "version": "1.0.0",
         "status": "running",
-        "connected": api.login if api else False,
+        "connected": login_status,
         "auto_login": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY"))
     }
 
 @app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
     """Manual login to Shioaji API (optional if auto-login is configured)"""
-    global api
+    global api, login_status
     try:
         # Login to Shioaji
         result = api.login(
@@ -109,6 +124,7 @@ async def login(request: LoginRequest):
         )
         
         if result:
+            login_status = True
             # Get account info
             accounts = api.list_accounts()
             account_info = {
@@ -122,6 +138,7 @@ async def login(request: LoginRequest):
                 account_info=account_info
             )
         else:
+            login_status = False
             return LoginResponse(
                 success=False,
                 message="Login failed"
@@ -134,10 +151,11 @@ async def login(request: LoginRequest):
 @app.post("/logout")
 async def logout():
     """Logout from Shioaji API"""
-    global api
+    global api, login_status
     try:
-        if api and api.login:
+        if api and login_status:
             api.logout()
+            login_status = False
             return {"success": True, "message": "Logout successful"}
         else:
             return {"success": False, "message": "Not logged in"}
@@ -150,7 +168,7 @@ async def get_accounts():
     """Get account information"""
     global api
     try:
-        if not api or not api.login:
+        if not api or not login_status:
             raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
         
         accounts = api.list_accounts()
@@ -175,7 +193,7 @@ async def get_positions():
     """Get current positions"""
     global api
     try:
-        if not api or not api.login:
+        if not api or not login_status:
             raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
         
         positions = api.list_positions()
@@ -201,7 +219,7 @@ async def place_order(request: OrderRequest):
     """Place a stock order"""
     global api
     try:
-        if not api or not api.login:
+        if not api or not login_status:
             raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
         
         # Get contract
@@ -237,7 +255,7 @@ async def get_quote(stock_code: str):
     """Get real-time quote for a stock"""
     global api
     try:
-        if not api or not api.login:
+        if not api or not login_status:
             raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
         
         # Get contract
@@ -270,9 +288,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "api_connected": api.login if api else False,
+        "api_connected": login_status,
         "auto_login_configured": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
-        "timestamp": str(sj.datetime.now())
+        "timestamp": str(datetime.now())
     }
 
 if __name__ == "__main__":
