@@ -56,24 +56,25 @@ async def startup_event():
         # Auto-login using environment variables
         api_key = os.getenv("SHIOAJI_API_KEY")
         secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-        person_id = os.getenv("SHIOAJI_PERSON_ID")
         
         if api_key and secret_key:
             try:
                 logger.info("Attempting auto-login with environment variables...")
-                result = api.login(
+                accounts = api.login(
                     api_key=api_key,
                     secret_key=secret_key,
-                    person_id=person_id
+                    fetch_contract=True,
+                    subscribe_trade=True
                 )
                 
-                if result:
+                if accounts:
                     login_status = True
-                    accounts = api.list_accounts()
                     logger.info(f"Auto-login successful! Connected accounts: {[acc.account_id for acc in accounts]}")
+                    logger.info(f"Stock account: {api.stock_account}")
+                    logger.info(f"Future account: {api.futopt_account}")
                 else:
                     login_status = False
-                    logger.error("Auto-login failed: Invalid credentials")
+                    logger.error("Auto-login failed: No accounts returned")
                     
             except Exception as e:
                 login_status = False
@@ -92,12 +93,12 @@ async def startup_event():
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
-    global api
-    if api:
+    global api, login_status
+    if api and login_status:
         try:
-            if hasattr(api, 'login') and api.login:
-                api.logout()
-                logger.info("Logged out from Shioaji API")
+            api.logout()
+            login_status = False
+            logger.info("Logged out from Shioaji API")
         except Exception as e:
             logger.error(f"Error during logout: {e}")
 
@@ -116,20 +117,28 @@ async def login(request: LoginRequest):
     """Manual login to Shioaji API (optional if auto-login is configured)"""
     global api, login_status
     try:
-        # Login to Shioaji
-        result = api.login(
+        accounts = api.login(
             api_key=request.api_key,
             secret_key=request.secret_key,
-            person_id=request.person_id
+            fetch_contract=True,
+            subscribe_trade=True
         )
         
-        if result:
+        if accounts:
             login_status = True
             # Get account info
-            accounts = api.list_accounts()
             account_info = {
-                "accounts": [acc.account_id for acc in accounts],
-                "login_time": str(result)
+                "accounts": [
+                    {
+                        "account_id": acc.account_id,
+                        "broker_id": acc.broker_id,
+                        "person_id": acc.person_id,
+                        "signed": acc.signed,
+                        "username": acc.username
+                    } for acc in accounts
+                ],
+                "stock_account": api.stock_account.account_id if api.stock_account else None,
+                "futopt_account": api.futopt_account.account_id if api.futopt_account else None
             }
             
             return LoginResponse(
@@ -141,7 +150,7 @@ async def login(request: LoginRequest):
             login_status = False
             return LoginResponse(
                 success=False,
-                message="Login failed"
+                message="Login failed - no accounts returned"
             )
             
     except Exception as e:
@@ -178,11 +187,15 @@ async def get_accounts():
                 {
                     "account_id": acc.account_id,
                     "broker_id": acc.broker_id,
-                    "account_type": acc.account_type,
-                    "signed": acc.signed
+                    "person_id": acc.person_id,
+                    "account_type": type(acc).__name__,
+                    "signed": acc.signed,
+                    "username": acc.username
                 }
                 for acc in accounts
-            ]
+            ],
+            "default_stock_account": api.stock_account.account_id if api.stock_account else None,
+            "default_futopt_account": api.futopt_account.account_id if api.futopt_account else None
         }
     except Exception as e:
         logger.error(f"Get accounts error: {e}")
@@ -223,17 +236,21 @@ async def place_order(request: OrderRequest):
             raise HTTPException(status_code=401, detail="Not logged in - please check environment variables")
         
         # Get contract
-        contract = api.Contracts.Stocks[request.code]
+        contract = api.Contracts.Stocks.get(request.code)
         if not contract:
             raise HTTPException(status_code=404, detail=f"Stock {request.code} not found")
         
-        # Create order
+        if not api.stock_account:
+            raise HTTPException(status_code=400, detail="No stock account available")
+        
+        # Create order with proper constants
         order = api.Order(
-            action=request.action,
-            price=request.price or 0,  # 0 for market order
+            action=getattr(sj.constant.Action, request.action),
+            price=request.price or 0,
             quantity=request.quantity,
             price_type=sj.constant.StockPriceType.LMT if request.price else sj.constant.StockPriceType.MKT,
             order_type=getattr(sj.constant.OrderType, request.order_type),
+            order_lot=sj.constant.StockOrderLot.Common,
             account=api.stock_account
         )
         
@@ -243,7 +260,7 @@ async def place_order(request: OrderRequest):
         return OrderResponse(
             success=True,
             message="Order placed successfully",
-            order_id=trade.order.id if trade else None
+            order_id=trade.order.id if trade and hasattr(trade, 'order') else None
         )
         
     except Exception as e:
