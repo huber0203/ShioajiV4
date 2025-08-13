@@ -573,8 +573,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 try:
                     ticks = api.ticks(
                         contract=contract,
-                        start=start_time.strftime('%Y-%m-%d'),
-                        end=end_time.strftime('%Y-%m-%d'),
+                        date=today.strftime('%Y-%m-%d'),
                         timeout=30000
                     )
                     
