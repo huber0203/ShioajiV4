@@ -221,13 +221,74 @@ async def logout():
         logger.error(f"Logout error: {e}")
         return {"success": False, "message": f"Logout failed: {str(e)}"}
 
+def check_connection():
+    """Check if Shioaji API is actually connected"""
+    global api, login_status
+    try:
+        if not api:
+            return False
+        
+        # Try to get account info to verify connection
+        accounts = api.list_accounts()
+        if accounts:
+            login_status = True
+            return True
+        else:
+            login_status = False
+            return False
+    except:
+        login_status = False
+        return False
+
+def ensure_login():
+    """Ensure we're logged in, attempt login if not"""
+    global api, login_status
+    
+    # First check if we're already connected
+    if check_connection():
+        return True
+    
+    # Try to login using environment variables
+    api_key = os.getenv("SHIOAJI_API_KEY")
+    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+    
+    if not api_key or not secret_key:
+        return False
+    
+    try:
+        if not api:
+            api = sj.Shioaji()
+        
+        api_key_clean = api_key.strip().strip('"').strip("'")
+        secret_key_clean = secret_key.strip().strip('"').strip("'")
+        
+        accounts = api.login(
+            api_key=api_key_clean,
+            secret_key=secret_key_clean,
+            fetch_contract=True,
+            subscribe_trade=True
+        )
+        
+        if accounts:
+            login_status = True
+            logger.info("Login successful via ensure_login")
+            return True
+        else:
+            login_status = False
+            return False
+            
+    except Exception as e:
+        logger.warning(f"ensure_login failed: {e}")
+        login_status = False
+        return False
+
 @app.get("/accounts")
 async def get_accounts():
     """Get account information"""
     global api
     try:
-        if not api or not login_status:
-            return {"success": False, "message": "Not logged in - please check environment variables"}
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
         
         accounts = api.list_accounts()
         return {
@@ -255,8 +316,8 @@ async def get_positions():
     """Get current positions"""
     global api
     try:
-        if not api or not login_status:
-            return {"success": False, "message": "Not logged in - please check environment variables"}
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
         
         positions = api.list_positions()
         return {
@@ -281,10 +342,10 @@ async def place_order(request: OrderRequest):
     """Place a stock order"""
     global api
     try:
-        if not api or not login_status:
+        if not ensure_login():
             return OrderResponse(
                 success=False,
-                message="Not logged in - please check environment variables"
+                message="Unable to connect - please check environment variables"
             )
         
         if request.action not in ["Buy", "Sell"]:
@@ -339,8 +400,8 @@ async def get_quote(stock_code: str):
     """Get real-time quote for a stock"""
     global api
     try:
-        if not api or not login_status:
-            return {"success": False, "message": "Not logged in - please check environment variables"}
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
         
         # Get contract
         contract = api.Contracts.Stocks.get(stock_code)
@@ -380,9 +441,11 @@ async def get_quote(stock_code: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    actual_connected = check_connection()
     return {
         "status": "healthy",
-        "api_connected": login_status,
+        "api_connected": actual_connected,
+        "login_status_var": login_status,
         "auto_login_configured": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
         "timestamp": str(datetime.now())
     }
