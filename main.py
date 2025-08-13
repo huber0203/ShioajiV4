@@ -529,7 +529,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 contract=contract,
                 start=start_time.strftime('%Y-%m-%d'),
                 end=end_time.strftime('%Y-%m-%d'),
-                timeout=30000
+                timeout=30000,
+                timeframe='5T'  # 5-minute timeframe (T = minutes in pandas notation)
             )
             
             if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
@@ -552,7 +553,32 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 if df.empty:
                     return {"success": False, "message": f"No intraday data available for {stock_code}"}
                 
-                # Process actual data from Shioaji (don't create empty intervals)
+                try:
+                    # Get tick data for buy/sell volume calculation
+                    ticks = api.ticks(
+                        contract=contract,
+                        start=start_time.strftime('%Y-%m-%d'),
+                        end=end_time.strftime('%Y-%m-%d'),
+                        timeout=30000
+                    )
+                    
+                    # Process tick data to calculate buy/sell volume for each 5-minute interval
+                    tick_df = None
+                    if ticks and hasattr(ticks, 'ts') and ticks.ts:
+                        tick_df = pd.DataFrame({
+                            'ts': ticks.ts,
+                            'close': ticks.close,
+                            'volume': ticks.volume,
+                            'bid_price': getattr(ticks, 'bid_price', [None] * len(ticks.ts)),
+                            'ask_price': getattr(ticks, 'ask_price', [None] * len(ticks.ts))
+                        })
+                        tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                        
+                except Exception as tick_error:
+                    logger.warning(f"Could not get tick data for {stock_code}: {tick_error}")
+                    tick_df = None
+                
+                # Process actual data from Shioaji
                 intraday_data = []
                 total_volume_today = 0
                 
@@ -566,6 +592,31 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     
                     avg_price = (open_price + high_price + low_price + close_price) / 4
                     
+                    buy_volume = None
+                    sell_volume = None
+                    
+                    if tick_df is not None:
+                        # Find ticks within this 5-minute interval
+                        interval_start = row['ts']
+                        interval_end = interval_start + pd.Timedelta(minutes=5)
+                        
+                        interval_ticks = tick_df[
+                            (tick_df['ts'] >= interval_start) & 
+                            (tick_df['ts'] < interval_end)
+                        ]
+                        
+                        if not interval_ticks.empty:
+                            # Simple heuristic: if tick price >= mid-price, consider it a buy
+                            # This is a simplified approach - real buy/sell classification is more complex
+                            mid_prices = (interval_ticks['bid_price'].fillna(close_price) + 
+                                        interval_ticks['ask_price'].fillna(close_price)) / 2
+                            
+                            buy_ticks = interval_ticks[interval_ticks['close'] >= mid_prices]
+                            sell_ticks = interval_ticks[interval_ticks['close'] < mid_prices]
+                            
+                            buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
+                            sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                    
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
                         "open": open_price,
@@ -574,10 +625,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         "close": close_price,
                         "average_price": round(avg_price, 2),
                         "volume": volume,
-                        # Note: Shioaji doesn't provide separate buy/sell volume in basic kbars
-                        # This would require tick data or additional API calls
-                        "buy_volume": None,  # Would need tick data analysis
-                        "sell_volume": None  # Would need tick data analysis
+                        "buy_volume": buy_volume,  # Now calculated from tick data
+                        "sell_volume": sell_volume  # Now calculated from tick data
                     }
                     intraday_data.append(bar_data)
                     total_volume_today += volume
@@ -618,11 +667,12 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     "current_date": now_tw.strftime('%Y-%m-%d'),
                     "target_time_data": target_bar,
                     "today_total_volume": total_volume_today,
-                    "intraday_bars": intraday_data,  # ALL actual bars from Shioaji
+                    "intraday_bars": intraday_data,  # ALL actual 5-minute bars from Shioaji
                     "total_bars_today": len(intraday_data),
                     "market_status": "open" if 9 <= current_hour < 13 or (current_hour == 13 and current_minute <= 30) else "closed",
                     "timezone": "Asia/Taipei (+8)",
-                    "data_range": f"{intraday_data[0]['time']} - {intraday_data[-1]['time']}" if intraday_data else "No data"
+                    "data_range": f"{intraday_data[0]['time']} - {intraday_data[-1]['time']}" if intraday_data else "No data",
+                    "buy_sell_data_available": tick_df is not None
                 }
                 
             except Exception as df_error:
