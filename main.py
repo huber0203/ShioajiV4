@@ -443,19 +443,21 @@ async def get_quote(stock_code: str):
         return {"success": False, "message": f"Error: {str(e)}"}
 
 @app.get("/technical/{stock_codes}")
-async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", session: str = "morning"):
-    """Get technical indicators for multiple stocks and timeframes with session control
+async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", session: str = "morning", date: str = None):
+    """Get technical indicators for multiple stocks and timeframes with session control and date selection
     
     Args:
         stock_codes: Single stock or comma-separated stocks (e.g., "2330" or "2454,2317")
         timeframe: Single timeframe or comma-separated timeframes (e.g., "daily" or "daily,5min")
         session: Trading session - "morning" (早盤 09:00-13:30) or "night" (夜盤 15:00-05:00)
+        date: Specific date to query (YYYY-MM-DD format, e.g., "2024-08-13"). If not provided, uses current date.
     
     Examples:
-        /technical/2330 - Single stock, daily data, morning session
-        /technical/2330?timeframe=5min&session=morning - 5min morning session data
-        /technical/2330?timeframe=5min&session=night - 5min night session data
-        /technical/2330,2454?timeframe=daily,5min&session=morning - Multiple stocks, both timeframes, morning session
+        /technical/2330 - Single stock, daily data, morning session, current date
+        /technical/2330?date=2024-08-13 - Single stock, daily data for specific date
+        /technical/2330?timeframe=5min&session=morning&date=2024-08-13 - 5min morning session data for specific date
+        /technical/2330?timeframe=5min&session=night&date=2024-08-13 - 5min night session data for specific date
+        /technical/2330,2454?timeframe=daily,5min&session=morning&date=2024-08-13 - Multiple stocks, both timeframes, specific date
     """
     global api
     try:
@@ -470,6 +472,14 @@ async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", s
         if session not in ["morning", "night"]:
             return {"success": False, "message": "Invalid session. Must be 'morning' or 'night'"}
         
+        # Parse and validate date parameter
+        target_date = None
+        if date:
+            try:
+                target_date = datetime.strptime(date, '%Y-%m-%d').date()
+            except ValueError:
+                return {"success": False, "message": "Invalid date format. Use YYYY-MM-DD (e.g., 2024-08-13)"}
+        
         results = {}
         
         for stock_code in stock_list:
@@ -483,8 +493,8 @@ async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", s
             
             for tf in timeframe_list:
                 try:
-                    # Get technical data for this stock, timeframe, and session
-                    tech_data = await get_single_stock_technical(stock_code, contract, tf, session)
+                    # Get technical data for this stock, timeframe, session, and date
+                    tech_data = await get_single_stock_technical(stock_code, contract, tf, session, target_date)
                     stock_results[tf] = tech_data
                     
                 except Exception as tf_error:
@@ -503,6 +513,7 @@ async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", s
                 "stocks": stock_list,
                 "timeframes": timeframe_list,
                 "session": session,
+                "date": date or "current",
                 "total_combinations": len(stock_list) * len(timeframe_list)
             },
             "results": results,
@@ -514,36 +525,48 @@ async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", s
         logger.error(f"Batch technical indicators error: {e}")
         return {"success": False, "message": f"Error: {str(e)}"}
 
-async def get_single_stock_technical(stock_code: str, contract, timeframe: str, session: str = "morning"):
-    """Helper function to get technical data for a single stock, timeframe, and session"""
+async def get_single_stock_technical(stock_code: str, contract, timeframe: str, session: str = "morning", target_date = None):
+    """Helper function to get technical data for a single stock, timeframe, session, and specific date"""
     global api
     
     from datetime import datetime, timedelta
     import statistics
     
-    if timeframe == "5min":
-        # Get intraday 1-minute data with session control
+    # Use target_date if provided, otherwise use current date
+    if target_date:
+        base_date = target_date
+        now_tw = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=12, minute=0)))
+    else:
         now_tw = datetime.now(TW_TZ)
-        today = now_tw.date()
+        base_date = now_tw.date()
+    
+    if timeframe == "5min":
+        # Get intraday 1-minute data with session control for specific date
         
         if session == "morning":
             # Morning session (早盤): 09:00 - 13:30 Taiwan time
-            start_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=9, minute=0)))
-            end_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=13, minute=30)))
+            start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=9, minute=0)))
+            end_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=13, minute=30)))
             session_name = "早盤 (Morning Session)"
         elif session == "night":
             # Night session (夜盤): 15:00 - 05:00 next day Taiwan time
-            # If current time is before 15:00, get previous day's night session
-            if now_tw.hour < 15:
-                # Get previous day's night session (15:00 yesterday - 05:00 today)
-                yesterday = today - timedelta(days=1)
-                start_time = TW_TZ.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=15, minute=0)))
-                end_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=5, minute=0)))
-            else:
-                # Get today's night session (15:00 today - 05:00 tomorrow)
-                tomorrow = today + timedelta(days=1)
-                start_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=15, minute=0)))
+            if target_date:
+                # For specific date, always get that date's night session
+                tomorrow = base_date + timedelta(days=1)
+                start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=15, minute=0)))
                 end_time = TW_TZ.localize(datetime.combine(tomorrow, datetime.min.time().replace(hour=5, minute=0)))
+            else:
+                # For current date, use existing logic
+                if now_tw.hour < 15:
+                    # Get previous day's night session (15:00 yesterday - 05:00 today)
+                    yesterday = base_date - timedelta(days=1)
+                    start_time = TW_TZ.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=15, minute=0)))
+                    end_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=5, minute=0)))
+                else:
+                    # Get today's night session (15:00 today - 05:00 tomorrow)
+                    tomorrow = base_date + timedelta(days=1)
+                    start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=15, minute=0)))
+                    end_time = TW_TZ.localize(datetime.combine(tomorrow, datetime.min.time().replace(hour=5, minute=0)))
             session_name = "夜盤 (Night Session)"
         
         try:
@@ -555,7 +578,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             )
             
             if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                return {"success": False, "message": f"No {session} session data available for {stock_code}"}
+                return {"success": False, "message": f"No {session} session data available for {stock_code} on {base_date}"}
             
             try:
                 # Convert kbars to DataFrame properly
@@ -574,7 +597,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 df = df[(df['ts'] >= start_time) & (df['ts'] <= end_time)]
                 
                 if df.empty:
-                    return {"success": False, "message": f"No {session} session data available for {stock_code} in specified time range"}
+                    return {"success": False, "message": f"No {session} session data available for {stock_code} on {base_date} in specified time range"}
                 
                 # Set timestamp as index for resampling
                 df.set_index('ts', inplace=True)
@@ -751,6 +774,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 return {
                     "success": True,
                     "session": session_name,
+                    "query_date": base_date.strftime('%Y-%m-%d'),
                     "session_time_range": f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}",
                     "current_time": now_tw.strftime('%H:%M'),
                     "current_date": now_tw.strftime('%Y-%m-%d'),
@@ -765,18 +789,24 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 }
                 
             except Exception as df_error:
-                logger.error(f"Error processing 5-minute data for {stock_code} {session} session: {df_error}")
+                logger.error(f"Error processing 5-minute data for {stock_code} {session} session on {base_date}: {df_error}")
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
         except Exception as e:
-            logger.error(f"Error getting 5min data for {stock_code} {session} session: {e}")
+            logger.error(f"Error getting 5min data for {stock_code} {session} session on {base_date}: {e}")
             return {"success": False, "message": f"5min data error: {str(e)}"}
         
     else:
-        # Daily data remains unchanged (session parameter doesn't affect daily data)
-        now_tw = datetime.now(TW_TZ)
-        end_date = now_tw
-        start_date = end_date - timedelta(days=50)
+        # Daily data with specific date support
+        if target_date:
+            # For specific date, get data around that date
+            end_date = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=23, minute=59)))
+            start_date = end_date - timedelta(days=50)
+        else:
+            # For current date, use existing logic
+            now_tw = datetime.now(TW_TZ)
+            end_date = now_tw
+            start_date = end_date - timedelta(days=50)
         
         try:
             kbars = api.kbars(
@@ -786,7 +816,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             )
             
             if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                return {"success": False, "message": f"No historical data available for {stock_code}"}
+                return {"success": False, "message": f"No historical data available for {stock_code} around {base_date}"}
             
             try:
                 df = pd.DataFrame({**kbars})
@@ -795,7 +825,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 if df.empty or len(df) < 5:
                     return {
                         "success": False, 
-                        "message": f"Insufficient historical data for {stock_code}. Got {len(df)} days, need at least 5."
+                        "message": f"Insufficient historical data for {stock_code} around {base_date}. Got {len(df)} days, need at least 5."
                     }
                 
                 # Extract price and volume data from DataFrame
@@ -857,6 +887,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 
                 return {
                     "success": True,
+                    "query_date": base_date.strftime('%Y-%m-%d'),
                     "current_price": current_price,
                     "moving_averages": {
                         "ma_20": round(ma_20, 2) if ma_20 else None,
@@ -885,11 +916,11 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 }
                 
             except Exception as df_error:
-                logger.error(f"Error converting daily kbars to DataFrame for {stock_code}: {df_error}")
+                logger.error(f"Error converting daily kbars to DataFrame for {stock_code} on {base_date}: {df_error}")
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
         except Exception as e:
-            logger.error(f"Error getting daily data for {stock_code}: {e}")
+            logger.error(f"Error getting daily data for {stock_code} on {base_date}: {e}")
             return {"success": False, "message": f"Daily data error: {str(e)}"}
 
 @app.get("/health")
