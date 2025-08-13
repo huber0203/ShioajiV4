@@ -4,8 +4,9 @@ import shioaji as sj
 import os
 from typing import Optional, Dict, Any
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
+import pytz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,9 @@ app = FastAPI(
 # Global Shioaji API instance
 api = None
 login_status = False
+
+# Taiwan timezone
+TW_TZ = pytz.timezone('Asia/Taipei')
 
 # Pydantic models
 class LoginRequest(BaseModel):
@@ -512,10 +516,13 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
     import statistics
     
     if timeframe == "5min":
-        # Get intraday 5-minute data for today
-        today = datetime.now()
-        start_time = today.replace(hour=9, minute=0, second=0, microsecond=0)
-        end_time = today.replace(hour=13, minute=30, second=0, microsecond=0)
+        # Get intraday 5-minute data for today with Taiwan timezone
+        now_tw = datetime.now(TW_TZ)
+        today = now_tw.date()
+        
+        # Market hours: 09:00 - 13:30 Taiwan time
+        start_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=9, minute=0)))
+        end_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=13, minute=30)))
         
         try:
             kbars = api.kbars(
@@ -530,23 +537,31 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             
             try:
                 df = pd.DataFrame({**kbars})
-                df.ts = pd.to_datetime(df.ts)
+                df.ts = pd.to_datetime(df.ts, utc=True).dt.tz_convert(TW_TZ)
                 
                 if df.empty:
                     return {"success": False, "message": f"No intraday data available for {stock_code}"}
                 
-                # Process 5-minute data
+                # Process ALL 5-minute data (not just last 10)
                 intraday_data = []
                 total_volume_today = 0
                 
                 for _, row in df.iterrows():
+                    # Calculate average price (OHLC average)
+                    avg_price = (float(row['Open']) + float(row['High']) + float(row['Low']) + float(row['Close'])) / 4
+                    
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
                         "open": float(row['Open']),
                         "high": float(row['High']),
                         "low": float(row['Low']),
                         "close": float(row['Close']),
-                        "volume": int(row['Volume'])
+                        "average_price": round(avg_price, 2),
+                        "volume": int(row['Volume']),
+                        # Note: Shioaji doesn't provide separate buy/sell volume in basic kbars
+                        # This would require tick data or additional API calls
+                        "buy_volume": None,  # Would need tick data analysis
+                        "sell_volume": None  # Would need tick data analysis
                     }
                     intraday_data.append(bar_data)
                     total_volume_today += bar_data["volume"]
@@ -554,31 +569,72 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 if not intraday_data:
                     return {"success": False, "message": f"Could not process intraday data for {stock_code}"}
                 
-                # Find specific time data
-                current_time = datetime.now()
+                # Generate complete 5-minute intervals from 09:05 to current time
+                complete_5min_bars = []
+                current_time = datetime.now(TW_TZ)
+                
+                # Start from 09:05, increment by 5 minutes
+                interval_time = TW_TZ.localize(datetime.combine(today, datetime.min.time().replace(hour=9, minute=5)))
+                
+                while interval_time <= current_time and interval_time.time() <= datetime.min.time().replace(hour=13, minute=30):
+                    time_str = interval_time.strftime('%H:%M')
+                    
+                    # Find matching data for this time interval
+                    matching_bar = None
+                    for bar in intraday_data:
+                        if bar["time"] == time_str:
+                            matching_bar = bar
+                            break
+                    
+                    if matching_bar:
+                        complete_5min_bars.append(matching_bar)
+                    else:
+                        # If no data for this interval, create empty bar with previous close
+                        prev_close = complete_5min_bars[-1]["close"] if complete_5min_bars else 0
+                        complete_5min_bars.append({
+                            "time": time_str,
+                            "open": prev_close,
+                            "high": prev_close,
+                            "low": prev_close,
+                            "close": prev_close,
+                            "average_price": prev_close,
+                            "volume": 0,
+                            "buy_volume": None,
+                            "sell_volume": None
+                        })
+                    
+                    interval_time += timedelta(minutes=5)
+                
+                # Find specific time data based on current time
                 target_time = None
-                if current_time.hour >= 13:
+                current_hour = current_time.hour
+                current_minute = current_time.minute
+                
+                if current_hour >= 13:
                     target_time = "12:15"
-                elif current_time.hour >= 12:
+                elif current_hour >= 12:
                     target_time = "11:15"
-                elif current_time.hour >= 11:
+                elif current_hour >= 11:
                     target_time = "10:15"
                 else:
                     target_time = "09:15"
                 
                 target_bar = None
-                for bar in intraday_data:
+                for bar in complete_5min_bars:
                     if bar["time"] == target_time:
                         target_bar = bar
                         break
                 
                 return {
                     "success": True,
-                    "current_time": current_time.strftime('%H:%M'),
+                    "current_time": current_time.strftime('%H:%M'),  # Now shows correct Taiwan time
+                    "current_date": current_time.strftime('%Y-%m-%d'),
                     "target_time_data": target_bar,
                     "today_total_volume": total_volume_today,
-                    "intraday_bars": intraday_data[-10:],  # Last 10 bars
-                    "total_bars_today": len(intraday_data)
+                    "intraday_bars": complete_5min_bars,  # ALL bars from 09:05 to current time
+                    "total_bars_today": len(complete_5min_bars),
+                    "market_status": "open" if 9 <= current_hour < 13 or (current_hour == 13 and current_minute <= 30) else "closed",
+                    "timezone": "Asia/Taipei (+8)"
                 }
                 
             except Exception as df_error:
@@ -590,8 +646,9 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             return {"success": False, "message": f"5min data error: {str(e)}"}
         
     else:
-        # Daily data with enhanced technical indicators
-        end_date = datetime.now()
+        # Daily data with enhanced technical indicators (existing code with timezone fix)
+        now_tw = datetime.now(TW_TZ)
+        end_date = now_tw
         start_date = end_date - timedelta(days=50)
         
         try:
@@ -606,7 +663,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             
             try:
                 df = pd.DataFrame({**kbars})
-                df.ts = pd.to_datetime(df.ts)
+                df.ts = pd.to_datetime(df.ts, utc=True).dt.tz_convert(TW_TZ)
                 
                 if df.empty or len(df) < 5:
                     return {
@@ -696,7 +753,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         "bollinger": bb_signal
                     },
                     "data_points": len(close_prices),
-                    "last_update": df.iloc[-1]['ts'].strftime('%Y-%m-%d %H:%M:%S') if not df.empty else None
+                    "last_update": df.iloc[-1]['ts'].strftime('%Y-%m-%d %H:%M:%S') if not df.empty else None,
+                    "timezone": "Asia/Taipei (+8)"
                 }
                 
             except Exception as df_error:
@@ -711,11 +769,14 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
 async def health_check():
     """Health check endpoint"""
     actual_connected = check_connection()
+    current_time_tw = datetime.now(TW_TZ)
     return {
         "status": "healthy",
         "api_connected": actual_connected,
         "login_status_var": login_status,
         "auto_login_configured": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
+        "current_time_tw": current_time_tw.strftime('%Y-%m-%d %H:%M:%S'),
+        "timezone": "Asia/Taipei (+8)",
         "timestamp": str(datetime.now())
     }
 
