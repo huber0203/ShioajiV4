@@ -530,21 +530,53 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             if not kbars_list:
                 return {"success": False, "message": f"No intraday data available for {stock_code}"}
             
-            # Process 5-minute data
+            # Process 5-minute data - handle different data structures
             intraday_data = []
             total_volume_today = 0
             
             for kbar in kbars_list:
-                bar_data = {
-                    "time": kbar.ts.strftime('%H:%M'),
-                    "open": float(kbar.Open),
-                    "high": float(kbar.High),
-                    "low": float(kbar.Low),
-                    "close": float(kbar.Close),
-                    "volume": int(kbar.Volume)
-                }
-                intraday_data.append(bar_data)
-                total_volume_today += int(kbar.Volume)
+                try:
+                    if hasattr(kbar, 'ts'):
+                        # Object with attributes
+                        bar_data = {
+                            "time": kbar.ts.strftime('%H:%M'),
+                            "open": float(kbar.Open),
+                            "high": float(kbar.High),
+                            "low": float(kbar.Low),
+                            "close": float(kbar.Close),
+                            "volume": int(kbar.Volume)
+                        }
+                    elif isinstance(kbar, (tuple, list)) and len(kbar) >= 6:
+                        # Tuple/list format: (timestamp, open, high, low, close, volume)
+                        timestamp = kbar[0] if hasattr(kbar[0], 'strftime') else datetime.fromtimestamp(kbar[0])
+                        bar_data = {
+                            "time": timestamp.strftime('%H:%M'),
+                            "open": float(kbar[1]),
+                            "high": float(kbar[2]),
+                            "low": float(kbar[3]),
+                            "close": float(kbar[4]),
+                            "volume": int(kbar[5])
+                        }
+                    else:
+                        # Try to access as dictionary
+                        bar_data = {
+                            "time": kbar.get('ts', datetime.now()).strftime('%H:%M') if hasattr(kbar.get('ts', datetime.now()), 'strftime') else "Unknown",
+                            "open": float(kbar.get('Open', 0)),
+                            "high": float(kbar.get('High', 0)),
+                            "low": float(kbar.get('Low', 0)),
+                            "close": float(kbar.get('Close', 0)),
+                            "volume": int(kbar.get('Volume', 0))
+                        }
+                    
+                    intraday_data.append(bar_data)
+                    total_volume_today += bar_data["volume"]
+                    
+                except Exception as bar_error:
+                    logger.warning(f"Error processing kbar for {stock_code}: {bar_error}, kbar type: {type(kbar)}")
+                    continue
+            
+            if not intraday_data:
+                return {"success": False, "message": f"Could not process intraday data for {stock_code}"}
             
             # Find specific time data
             current_time = datetime.now()
@@ -580,7 +612,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
     else:
         # Daily data with enhanced technical indicators
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=80)
+        start_date = end_date - timedelta(days=50)
         
         try:
             kbars = api.kbars(
@@ -591,10 +623,10 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             
             kbars_list = list(kbars) if kbars else []
             
-            if not kbars_list or len(kbars_list) < 40:
+            if not kbars_list or len(kbars_list) < 20:
                 return {
                     "success": False, 
-                    "message": f"Insufficient historical data for {stock_code}. Got {len(kbars_list) if kbars_list else 0} days, need at least 40."
+                    "message": f"Insufficient historical data for {stock_code}. Got {len(kbars_list) if kbars_list else 0} days, need at least 20."
                 }
             
             # Extract price and volume data
@@ -622,7 +654,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             
             # Calculate indicators
             ma_20 = calculate_ma(close_prices, 20)
-            ma_40 = calculate_ma(close_prices, 40)
+            ma_40 = calculate_ma(close_prices, 40) if len(close_prices) >= 40 else None
             bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
             
             # Volume analysis
@@ -637,11 +669,15 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             trend_signal = None
             bb_signal = None
             
-            if ma_20 and ma_40:
-                if ma_20 > ma_40:
-                    trend_signal = "bullish" if current_price > ma_20 else "neutral"
+            if ma_20:
+                if ma_40:
+                    if ma_20 > ma_40:
+                        trend_signal = "bullish" if current_price > ma_20 else "neutral"
+                    else:
+                        trend_signal = "bearish" if current_price < ma_20 else "neutral"
                 else:
-                    trend_signal = "bearish" if current_price < ma_20 else "neutral"
+                    # Use only MA20 for trend if MA40 is not available
+                    trend_signal = "bullish" if current_price > ma_20 else "bearish"
             
             if bb_upper and bb_lower and current_price:
                 if current_price > bb_upper:
@@ -656,7 +692,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 "current_price": current_price,
                 "moving_averages": {
                     "ma_20": round(ma_20, 2) if ma_20 else None,
-                    "ma_40": round(ma_40, 2) if ma_40 else None
+                    "ma_40": round(ma_40, 2) if ma_40 else None,
+                    "ma_40_available": ma_40 is not None
                 },
                 "bollinger_bands": {
                     "middle": round(bb_ma, 2) if bb_ma else None,
