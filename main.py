@@ -16,7 +16,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
 # Global Shioaji API instance
 api = None
 login_status = False
@@ -547,7 +546,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                             "volume": int(kbar.Volume)
                         }
                     elif isinstance(kbar, (tuple, list)) and len(kbar) >= 6:
-                        # Tuple/list format: (timestamp, open, high, low, close, volume)
                         timestamp = kbar[0] if hasattr(kbar[0], 'strftime') else datetime.fromtimestamp(kbar[0])
                         bar_data = {
                             "time": timestamp.strftime('%H:%M'),
@@ -558,15 +556,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                             "volume": int(kbar[5])
                         }
                     else:
-                        # Try to access as dictionary
-                        bar_data = {
-                            "time": kbar.get('ts', datetime.now()).strftime('%H:%M') if hasattr(kbar.get('ts', datetime.now()), 'strftime') else "Unknown",
-                            "open": float(kbar.get('Open', 0)),
-                            "high": float(kbar.get('High', 0)),
-                            "low": float(kbar.get('Low', 0)),
-                            "close": float(kbar.get('Close', 0)),
-                            "volume": int(kbar.get('Volume', 0))
-                        }
+                        logger.warning(f"Unknown kbar structure for {stock_code}: {type(kbar)}")
+                        continue
                     
                     intraday_data.append(bar_data)
                     total_volume_today += bar_data["volume"]
@@ -623,10 +614,10 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
             
             kbars_list = list(kbars) if kbars else []
             
-            if not kbars_list or len(kbars_list) < 20:
+            if not kbars_list or len(kbars_list) < 10:
                 return {
                     "success": False, 
-                    "message": f"Insufficient historical data for {stock_code}. Got {len(kbars_list) if kbars_list else 0} days, need at least 20."
+                    "message": f"Insufficient historical data for {stock_code}. Got {len(kbars_list) if kbars_list else 0} days, need at least 10."
                 }
             
             # Extract price and volume data
@@ -652,15 +643,14 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                 
                 return ma, upper_band, lower_band
             
-            # Calculate indicators
-            ma_20 = calculate_ma(close_prices, 20)
-            ma_40 = calculate_ma(close_prices, 40) if len(close_prices) >= 40 else None
-            bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
+            ma_20 = calculate_ma(close_prices, min(20, len(close_prices)))
+            ma_40 = calculate_ma(close_prices, min(40, len(close_prices))) if len(close_prices) >= 10 else None
+            bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, min(20, len(close_prices)), 2)
             
             # Volume analysis
             current_volume = volumes[-1] if volumes else 0
-            avg_volume_5d = calculate_ma(volumes, 5) if len(volumes) >= 5 else None
-            avg_volume_20d = calculate_ma(volumes, 20) if len(volumes) >= 20 else None
+            avg_volume_5d = calculate_ma(volumes, min(5, len(volumes))) if len(volumes) >= 3 else None
+            avg_volume_20d = calculate_ma(volumes, min(20, len(volumes))) if len(volumes) >= 10 else None
             
             # Get current price
             current_price = close_prices[-1] if close_prices else None
@@ -808,3 +798,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
+</merged_code>
