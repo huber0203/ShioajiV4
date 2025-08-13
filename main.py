@@ -517,158 +517,170 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
         start_time = today.replace(hour=9, minute=0, second=0, microsecond=0)
         end_time = today.replace(hour=13, minute=30, second=0, microsecond=0)
         
-        # Get 5-minute K-bar data
-        kbars = api.kbars(
-            contract=contract,
-            start=start_time.strftime('%Y-%m-%d %H:%M:%S'),
-            end=end_time.strftime('%Y-%m-%d %H:%M:%S'),
-            timeout=30000
-        )
-        
-        if not kbars:
-            return {"success": False, "message": f"No intraday data available for {stock_code}"}
-        
-        # Process 5-minute data
-        intraday_data = []
-        total_volume_today = 0
-        
-        for kbar in kbars:
-            bar_data = {
-                "time": kbar.ts.strftime('%H:%M'),
-                "open": float(kbar.Open),
-                "high": float(kbar.High),
-                "low": float(kbar.Low),
-                "close": float(kbar.Close),
-                "volume": int(kbar.Volume)
+        try:
+            kbars = api.kbars(
+                contract=contract,
+                start=start_time.strftime('%Y-%m-%d'),
+                end=end_time.strftime('%Y-%m-%d'),
+                timeout=30000
+            )
+            
+            kbars_list = list(kbars) if kbars else []
+            
+            if not kbars_list:
+                return {"success": False, "message": f"No intraday data available for {stock_code}"}
+            
+            # Process 5-minute data
+            intraday_data = []
+            total_volume_today = 0
+            
+            for kbar in kbars_list:
+                bar_data = {
+                    "time": kbar.ts.strftime('%H:%M'),
+                    "open": float(kbar.Open),
+                    "high": float(kbar.High),
+                    "low": float(kbar.Low),
+                    "close": float(kbar.Close),
+                    "volume": int(kbar.Volume)
+                }
+                intraday_data.append(bar_data)
+                total_volume_today += int(kbar.Volume)
+            
+            # Find specific time data
+            current_time = datetime.now()
+            target_time = None
+            if current_time.hour >= 13:
+                target_time = "12:15"
+            elif current_time.hour >= 12:
+                target_time = "11:15"
+            elif current_time.hour >= 11:
+                target_time = "10:15"
+            else:
+                target_time = "09:15"
+            
+            target_bar = None
+            for bar in intraday_data:
+                if bar["time"] == target_time:
+                    target_bar = bar
+                    break
+            
+            return {
+                "success": True,
+                "current_time": current_time.strftime('%H:%M'),
+                "target_time_data": target_bar,
+                "today_total_volume": total_volume_today,
+                "intraday_bars": intraday_data[-10:],  # Last 10 bars
+                "total_bars_today": len(intraday_data)
             }
-            intraday_data.append(bar_data)
-            total_volume_today += int(kbar.Volume)
-        
-        # Find specific time data
-        current_time = datetime.now()
-        target_time = None
-        if current_time.hour >= 13:
-            target_time = "12:15"
-        elif current_time.hour >= 12:
-            target_time = "11:15"
-        elif current_time.hour >= 11:
-            target_time = "10:15"
-        else:
-            target_time = "09:15"
-        
-        target_bar = None
-        for bar in intraday_data:
-            if bar["time"] == target_time:
-                target_bar = bar
-                break
-        
-        return {
-            "success": True,
-            "current_time": current_time.strftime('%H:%M'),
-            "target_time_data": target_bar,
-            "today_total_volume": total_volume_today,
-            "intraday_bars": intraday_data[-10:],  # Last 10 bars
-            "total_bars_today": len(intraday_data)
-        }
+            
+        except Exception as e:
+            logger.error(f"Error getting 5min data for {stock_code}: {e}")
+            return {"success": False, "message": f"5min data error: {str(e)}"}
         
     else:
         # Daily data with enhanced technical indicators
         end_date = datetime.now()
         start_date = end_date - timedelta(days=80)
         
-        # Get historical daily data
-        kbars = api.kbars(
-            contract=contract,
-            start=start_date.strftime('%Y-%m-%d'),
-            end=end_date.strftime('%Y-%m-%d')
-        )
-        
-        if not kbars or len(kbars) < 40:
+        try:
+            kbars = api.kbars(
+                contract=contract,
+                start=start_date.strftime('%Y-%m-%d'),
+                end=end_date.strftime('%Y-%m-%d')
+            )
+            
+            kbars_list = list(kbars) if kbars else []
+            
+            if not kbars_list or len(kbars_list) < 40:
+                return {
+                    "success": False, 
+                    "message": f"Insufficient historical data for {stock_code}. Got {len(kbars_list) if kbars_list else 0} days, need at least 40."
+                }
+            
+            # Extract price and volume data
+            close_prices = [float(kbar.Close) for kbar in kbars_list]
+            volumes = [int(kbar.Volume) for kbar in kbars_list]
+            
+            def calculate_ma(prices, period):
+                if len(prices) < period:
+                    return None
+                return sum(prices[-period:]) / period
+            
+            def calculate_bollinger_bands(prices, period=20, std_dev=2):
+                if len(prices) < period:
+                    return None, None, None
+                
+                recent_prices = prices[-period:]
+                ma = sum(recent_prices) / period
+                variance = sum((price - ma) ** 2 for price in recent_prices) / period
+                std = variance ** 0.5
+                
+                upper_band = ma + (std_dev * std)
+                lower_band = ma - (std_dev * std)
+                
+                return ma, upper_band, lower_band
+            
+            # Calculate indicators
+            ma_20 = calculate_ma(close_prices, 20)
+            ma_40 = calculate_ma(close_prices, 40)
+            bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
+            
+            # Volume analysis
+            current_volume = volumes[-1] if volumes else 0
+            avg_volume_5d = calculate_ma(volumes, 5) if len(volumes) >= 5 else None
+            avg_volume_20d = calculate_ma(volumes, 20) if len(volumes) >= 20 else None
+            
+            # Get current price
+            current_price = close_prices[-1] if close_prices else None
+            
+            # Calculate trend signals
+            trend_signal = None
+            bb_signal = None
+            
+            if ma_20 and ma_40:
+                if ma_20 > ma_40:
+                    trend_signal = "bullish" if current_price > ma_20 else "neutral"
+                else:
+                    trend_signal = "bearish" if current_price < ma_20 else "neutral"
+            
+            if bb_upper and bb_lower and current_price:
+                if current_price > bb_upper:
+                    bb_signal = "overbought"
+                elif current_price < bb_lower:
+                    bb_signal = "oversold"
+                else:
+                    bb_signal = "normal"
+            
             return {
-                "success": False, 
-                "message": f"Insufficient historical data for {stock_code}. Need at least 40 days of data."
+                "success": True,
+                "current_price": current_price,
+                "moving_averages": {
+                    "ma_20": round(ma_20, 2) if ma_20 else None,
+                    "ma_40": round(ma_40, 2) if ma_40 else None
+                },
+                "bollinger_bands": {
+                    "middle": round(bb_ma, 2) if bb_ma else None,
+                    "upper": round(bb_upper, 2) if bb_upper else None,
+                    "lower": round(bb_lower, 2) if bb_lower else None,
+                    "signal": bb_signal
+                },
+                "volume_analysis": {
+                    "current_volume": current_volume,
+                    "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,
+                    "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None,
+                    "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None
+                },
+                "signals": {
+                    "trend": trend_signal,
+                    "bollinger": bb_signal
+                },
+                "data_points": len(close_prices),
+                "last_update": kbars_list[-1].ts.strftime('%Y-%m-%d %H:%M:%S') if kbars_list else None
             }
-        
-        # Extract price and volume data
-        close_prices = [float(kbar.Close) for kbar in kbars]
-        volumes = [int(kbar.Volume) for kbar in kbars]
-        
-        def calculate_ma(prices, period):
-            if len(prices) < period:
-                return None
-            return sum(prices[-period:]) / period
-        
-        def calculate_bollinger_bands(prices, period=20, std_dev=2):
-            if len(prices) < period:
-                return None, None, None
             
-            recent_prices = prices[-period:]
-            ma = sum(recent_prices) / period
-            variance = sum((price - ma) ** 2 for price in recent_prices) / period
-            std = variance ** 0.5
-            
-            upper_band = ma + (std_dev * std)
-            lower_band = ma - (std_dev * std)
-            
-            return ma, upper_band, lower_band
-        
-        # Calculate indicators
-        ma_20 = calculate_ma(close_prices, 20)
-        ma_40 = calculate_ma(close_prices, 40)
-        bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
-        
-        # Volume analysis
-        current_volume = volumes[-1] if volumes else 0
-        avg_volume_5d = calculate_ma(volumes, 5) if len(volumes) >= 5 else None
-        avg_volume_20d = calculate_ma(volumes, 20) if len(volumes) >= 20 else None
-        
-        # Get current price
-        current_price = close_prices[-1] if close_prices else None
-        
-        # Calculate trend signals
-        trend_signal = None
-        bb_signal = None
-        
-        if ma_20 and ma_40:
-            if ma_20 > ma_40:
-                trend_signal = "bullish" if current_price > ma_20 else "neutral"
-            else:
-                trend_signal = "bearish" if current_price < ma_20 else "neutral"
-        
-        if bb_upper and bb_lower and current_price:
-            if current_price > bb_upper:
-                bb_signal = "overbought"
-            elif current_price < bb_lower:
-                bb_signal = "oversold"
-            else:
-                bb_signal = "normal"
-        
-        return {
-            "success": True,
-            "current_price": current_price,
-            "moving_averages": {
-                "ma_20": round(ma_20, 2) if ma_20 else None,
-                "ma_40": round(ma_40, 2) if ma_40 else None
-            },
-            "bollinger_bands": {
-                "middle": round(bb_ma, 2) if bb_ma else None,
-                "upper": round(bb_upper, 2) if bb_upper else None,
-                "lower": round(bb_lower, 2) if bb_lower else None,
-                "signal": bb_signal
-            },
-            "volume_analysis": {
-                "current_volume": current_volume,
-                "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,
-                "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None,
-                "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None
-            },
-            "signals": {
-                "trend": trend_signal,
-                "bollinger": bb_signal
-            },
-            "data_points": len(close_prices),
-            "last_update": kbars[-1].ts.strftime('%Y-%m-%d %H:%M:%S') if kbars else None
-        }
+        except Exception as e:
+            logger.error(f"Error getting daily data for {stock_code}: {e}")
+            return {"success": False, "message": f"Daily data error: {str(e)}"}
 
 @app.get("/health")
 async def health_check():
