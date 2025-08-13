@@ -571,7 +571,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     return {"success": False, "message": f"Could not create 5-minute bars for {stock_code}"}
                 
                 try:
-                    # Get tick data for buy/sell volume calculation
                     ticks = api.ticks(
                         contract=contract,
                         start=start_time.strftime('%Y-%m-%d'),
@@ -582,17 +581,31 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     # Process tick data to calculate buy/sell volume for each 5-minute interval
                     tick_df = None
                     if ticks and hasattr(ticks, 'ts') and ticks.ts:
-                        tick_df = pd.DataFrame({
-                            'ts': ticks.ts,
-                            'close': ticks.close,
-                            'volume': ticks.volume,
-                            'bid_price': getattr(ticks, 'bid_price', [None] * len(ticks.ts)),
-                            'ask_price': getattr(ticks, 'ask_price', [None] * len(ticks.ts))
-                        })
+                        tick_data = {
+                            'ts': ticks.ts, 
+                            'close': ticks.close, 
+                            'volume': ticks.volume
+                        }
+                        
+                        # Add official buy/sell volume attributes if available
+                        if hasattr(ticks, 'bid_side_total_vol') and ticks.bid_side_total_vol:
+                            tick_data['bid_side_total_vol'] = ticks.bid_side_total_vol
+                        if hasattr(ticks, 'ask_side_total_vol') and ticks.ask_side_total_vol:
+                            tick_data['ask_side_total_vol'] = ticks.ask_side_total_vol
+                        if hasattr(ticks, 'tick_type') and ticks.tick_type:
+                            tick_data['tick_type'] = ticks.tick_type
+                        
+                        # Check what attributes are actually available
+                        available_attrs = list(tick_data.keys())
+                        logger.info(f"Available tick attributes for {stock_code}: {available_attrs}")
+                        
+                        tick_df = pd.DataFrame(tick_data)
                         tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
                         
+                        logger.info(f"Processed {len(tick_df)} ticks for {stock_code}")
+                        
                 except Exception as tick_error:
-                    logger.warning(f"Could not get tick data for {stock_code}: {tick_error}")
+                    logger.error(f"Tick data error for {stock_code}: {tick_error}")
                     tick_df = None
                 
                 intraday_data = []
@@ -611,7 +624,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                     buy_volume = None
                     sell_volume = None
                     
-                    if tick_df is not None:
+                    if tick_df is not None and not tick_df.empty:
                         # Find ticks within this 5-minute interval
                         interval_start = row['ts'] - pd.Timedelta(minutes=5)
                         interval_end = row['ts']
@@ -622,16 +635,49 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         ]
                         
                         if not interval_ticks.empty:
-                            # Simple heuristic: if tick price >= mid-price, consider it a buy
-                            # This is a simplified approach - real buy/sell classification is more complex
-                            mid_prices = (interval_ticks['bid_price'].fillna(close_price) + 
-                                        interval_ticks['ask_price'].fillna(close_price)) / 2
+                            if 'bid_side_total_vol' in interval_ticks.columns and 'ask_side_total_vol' in interval_ticks.columns:
+                                # Use official buy/sell volume totals from the last tick in the interval
+                                last_tick = interval_ticks.iloc[-1]
+                                buy_volume = int(last_tick['bid_side_total_vol']) if pd.notna(last_tick['bid_side_total_vol']) else None
+                                sell_volume = int(last_tick['ask_side_total_vol']) if pd.notna(last_tick['ask_side_total_vol']) else None
+                                
+                                # If we have previous interval data, calculate the difference
+                                if len(intraday_data) > 0:
+                                    prev_buy = intraday_data[-1].get('buy_volume_cumulative', 0) or 0
+                                    prev_sell = intraday_data[-1].get('sell_volume_cumulative', 0) or 0
+                                    
+                                    # Calculate interval buy/sell volume as difference from cumulative
+                                    interval_buy = max(0, buy_volume - prev_buy) if buy_volume else None
+                                    interval_sell = max(0, sell_volume - prev_sell) if sell_volume else None
+                                    
+                                    buy_volume = interval_buy
+                                    sell_volume = interval_sell
+                                
+                            elif 'tick_type' in interval_ticks.columns:
+                                # Fallback: Use tick_type classification (1=buy, 2=sell, 0=neutral)
+                                buy_ticks = interval_ticks[interval_ticks['tick_type'] == 1]
+                                sell_ticks = interval_ticks[interval_ticks['tick_type'] == 2]
+                                
+                                buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
+                                sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                                
+                            else:
+                                # Simple heuristic: compare with interval average price
+                                interval_avg = (open_price + close_price) / 2
+                                buy_ticks = interval_ticks[interval_ticks['close'] >= interval_avg]
+                                sell_ticks = interval_ticks[interval_ticks['close'] < interval_avg]
+                                
+                                buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
+                                sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
                             
-                            buy_ticks = interval_ticks[interval_ticks['close'] >= mid_prices]
-                            sell_ticks = interval_ticks[interval_ticks['close'] < mid_prices]
-                            
-                            buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
-                            sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                            # Ensure buy + sell doesn't exceed total volume (for non-cumulative data)
+                            if buy_volume is not None and sell_volume is not None:
+                                total_tick_volume = buy_volume + sell_volume
+                                if total_tick_volume > volume and total_tick_volume > 0:
+                                    # Proportionally adjust if tick volume exceeds K-bar volume
+                                    ratio = volume / total_tick_volume
+                                    buy_volume = int(buy_volume * ratio)
+                                    sell_volume = int(sell_volume * ratio)
                     
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
@@ -644,9 +690,23 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str):
                         "buy_volume": buy_volume,
                         "sell_volume": sell_volume
                     }
+                    
+                    if tick_df is not None and not tick_df.empty:
+                        interval_start = row['ts'] - pd.Timedelta(minutes=5)
+                        interval_end = row['ts']
+                        interval_ticks = tick_df[
+                            (tick_df['ts'] > interval_start) & 
+                            (tick_df['ts'] <= interval_end)
+                        ]
+                        
+                        if not interval_ticks.empty and 'bid_side_total_vol' in interval_ticks.columns:
+                            last_tick = interval_ticks.iloc[-1]
+                            bar_data['buy_volume_cumulative'] = int(last_tick['bid_side_total_vol']) if pd.notna(last_tick['bid_side_total_vol']) else 0
+                            bar_data['sell_volume_cumulative'] = int(last_tick['ask_side_total_vol']) if pd.notna(last_tick['ask_side_total_vol']) else 0
+                    
                     intraday_data.append(bar_data)
                     total_volume_today += volume
-                
+
                 if not intraday_data:
                     return {"success": False, "message": f"Could not process 5-minute data for {stock_code}"}
                 
