@@ -60,11 +60,35 @@ async def startup_event():
         logger.info(f"SHIOAJI_PERSON_ID: {'SET' if os.getenv('SHIOAJI_PERSON_ID') else 'NOT SET'}")
         
         if api_key and secret_key:
+            logger.info(f"API Key length: {len(api_key)}")
+            logger.info(f"Secret Key length: {len(secret_key)}")
+            logger.info(f"API Key first 4 chars: {api_key[:4]}...")
+            logger.info(f"Secret Key first 4 chars: {secret_key[:4]}...")
+            
+            # Check for problematic characters
+            problematic_chars = ['$', '"', "'", '\\', '\n', '\r', '\t']
+            api_key_issues = [char for char in problematic_chars if char in api_key]
+            secret_key_issues = [char for char in problematic_chars if char in secret_key]
+            
+            if api_key_issues:
+                logger.warning(f"API Key contains problematic characters: {api_key_issues}")
+            if secret_key_issues:
+                logger.warning(f"Secret Key contains problematic characters: {secret_key_issues}")
+            
+            # Clean the environment variables
+            api_key_clean = api_key.strip().strip('"').strip("'")
+            secret_key_clean = secret_key.strip().strip('"').strip("'")
+            
+            if api_key_clean != api_key:
+                logger.info("API Key was cleaned (removed quotes/whitespace)")
+            if secret_key_clean != secret_key:
+                logger.info("Secret Key was cleaned (removed quotes/whitespace)")
+            
             try:
                 logger.info("Attempting auto-login with environment variables...")
                 accounts = api.login(
-                    api_key=api_key,
-                    secret_key=secret_key,
+                    api_key=api_key_clean,
+                    secret_key=secret_key_clean,
                     fetch_contract=True,
                     subscribe_trade=True
                 )
@@ -371,11 +395,18 @@ async def retry_auto_login():
                 }
             }
         
+        logger.info(f"Retry - API Key length: {len(api_key)}")
+        logger.info(f"Retry - Secret Key length: {len(secret_key)}")
+        
+        # Clean the environment variables
+        api_key_clean = api_key.strip().strip('"').strip("'")
+        secret_key_clean = secret_key.strip().strip('"').strip("'")
+        
         try:
             logger.info("Retrying auto-login...")
             accounts = api.login(
-                api_key=api_key,
-                secret_key=secret_key,
+                api_key=api_key_clean,
+                secret_key=secret_key_clean,
                 fetch_contract=True,
                 subscribe_trade=True
             )
