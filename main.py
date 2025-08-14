@@ -563,19 +563,25 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             base_date = now_tw.date()
         
         if timeframe == "5min":
-            # Get intraday 1-minute data
+            # 🔴 修正：5分鐘資料需要指定日期範圍
+            date_str = base_date.strftime('%Y-%m-%d')
+            
+            logger.info(f"Getting intraday kbars for date: {date_str}")
+            
             try:
-                # Get all available recent data
+                # Get intraday 1-minute data with date range
                 kbars = api.kbars(
                     contract=contract,
+                    start=date_str,  # 🔴 加入 start 參數
+                    end=date_str,    # 🔴 加入 end 參數（同一天）
                     timeout=30000
                 )
                 
                 logger.info(f"Raw kbars object type: {type(kbars)}")
                 
                 if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                    logger.info(f"No kbars data available")
-                    return {"success": False, "message": f"No intraday data available for {stock_code}"}
+                    logger.info(f"No kbars data available for {date_str}")
+                    return {"success": False, "message": f"No intraday data available for {stock_code} on {date_str}"}
                 
                 # Convert kbars to DataFrame properly
                 df = pd.DataFrame({
@@ -589,8 +595,9 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 
                 logger.info(f"DataFrame shape after conversion: {df.shape}")
                 
-                # Convert timestamps to Taiwan timezone
-                df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                # 🔴 修正：正確轉換時間戳記（nanosecond to datetime）
+                df['ts'] = pd.to_datetime(df['ts'], unit='ns')
+                df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert(TW_TZ)
                 
                 # Analyze available time range
                 min_hour = df['ts'].dt.hour.min()
@@ -600,6 +607,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 logger.info(f"📊 Available time range: {min_hour}:00 - {max_hour}:00")
                 logger.info(f"📊 Available hours: {unique_hours}")
                 logger.info(f"📊 Total data points: {len(df)}")
+                logger.info(f"📊 Date range: {df['ts'].min()} to {df['ts'].max()}")
                 
                 # Smart time filtering strategy
                 if session == "morning":
@@ -649,8 +657,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 if df_session.empty:
                     return {
                         "success": False, 
-                        "message": f"No data available for {stock_code} {session} session",
-                        "available_hours": [int(h) for h in unique_hours],  # Convert numpy int to Python int
+                        "message": f"No data available for {stock_code} {session} session on {date_str}",
+                        "available_hours": [int(h) for h in unique_hours],
                         "available_time_range": f"{min_hour}:00 - {max_hour}:00",
                         "requested_session": session_name
                     }
@@ -701,7 +709,9 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                             tick_data['tick_type'] = ticks.tick_type
                         
                         tick_df = pd.DataFrame(tick_data)
-                        tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                        # 🔴 修正：正確轉換 tick 時間戳記
+                        tick_df['ts'] = pd.to_datetime(tick_df['ts'], unit='ns')
+                        tick_df['ts'] = tick_df['ts'].dt.tz_localize('UTC').dt.tz_convert(TW_TZ)
                         
                         # Filter tick data to match session time range
                         session_start = df_session.index.min()
@@ -763,7 +773,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                     buy_volume += neutral_volume // 2
                                     sell_volume += neutral_volume - (neutral_volume // 2)
                                 
-                                logger.info(f"🎯 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張, 中性{neutral_volume}張 (共{len(interval_ticks)}筆tick)")
+                                logger.debug(f"🎯 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張, 中性{neutral_volume}張")
                                 
                             else:
                                 # Use price judgment method (fallback)
@@ -774,7 +784,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
                                 
-                                logger.info(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (價格判斷法)")
+                                logger.debug(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (價格判斷法)")
                             
                             # Ensure tick total volume doesn't exceed K-bar volume
                             total_tick_volume = buy_volume + sell_volume
@@ -782,16 +792,15 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                 ratio = volume / total_tick_volume
                                 buy_volume = int(buy_volume * ratio)
                                 sell_volume = int(sell_volume * ratio)
-                                logger.info(f"🔧 調整: {row['ts'].strftime('%H:%M')} 買{buy_volume}張, 賣{sell_volume}張 (比例={ratio:.2f})")
+                                logger.debug(f"🔧 調整: {row['ts'].strftime('%H:%M')} 買{buy_volume}張, 賣{sell_volume}張")
                                 
                     # Fallback: estimate when no tick data available
                     if (buy_volume is None or sell_volume is None) and volume > 0:
                         buy_volume = volume // 2
                         sell_volume = volume - buy_volume
-                        logger.info(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (50/50估算)")
+                        logger.debug(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (50/50估算)")
 
                     # Build 5-minute K-bar data (including buy/sell volumes)
-                    # Convert all numpy types to Python native types for JSON serialization
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
                         "datetime": row['ts'].strftime('%Y-%m-%d %H:%M:%S'),
@@ -801,11 +810,11 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         "low": float(low_price),
                         "close": float(close_price),
                         "average_price": round(float(avg_price), 2),
-                        "volume": int(volume),           # Total volume
-                        "buy_volume": int(buy_volume) if buy_volume is not None else None,   # Buy volume
-                        "sell_volume": int(sell_volume) if sell_volume is not None else None, # Sell volume
+                        "volume": int(volume),
+                        "buy_volume": int(buy_volume) if buy_volume is not None else None,
+                        "sell_volume": int(sell_volume) if sell_volume is not None else None,
                         "buy_sell_ratio": round(float(buy_volume) / float(sell_volume), 2) if buy_volume and sell_volume and sell_volume > 0 else None,
-                        "net_flow": int(buy_volume) - int(sell_volume) if buy_volume is not None and sell_volume is not None else None  # Net flow
+                        "net_flow": int(buy_volume) - int(sell_volume) if buy_volume is not None and sell_volume is not None else None
                     }
                     
                     intraday_data.append(bar_data)
@@ -827,7 +836,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     "session": session_name,
                     "time_strategy": time_strategy,
                     "query_date": base_date.strftime('%Y-%m-%d'),
-                    "available_hours": [int(h) for h in unique_hours],  # Convert numpy int to Python int
+                    "available_hours": [int(h) for h in unique_hours],
                     "data_time_range": f"{df_session.index.min().strftime('%H:%M')} - {df_session.index.max().strftime('%H:%M')}",
                     "session_summary": {
                         "total_volume": int(total_volume_session),
@@ -836,7 +845,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         "net_flow": int(total_buy_volume) - int(total_sell_volume) if total_buy_volume and total_sell_volume else None,
                         "buy_sell_ratio": round(float(total_buy_volume) / float(total_sell_volume), 2) if total_buy_volume and total_sell_volume and total_sell_volume > 0 else None
                     },
-                    "intraday_bars": intraday_data,  # Detailed 5-minute buy/sell volumes!
+                    "intraday_bars": intraday_data,
                     "total_bars": len(intraday_data),
                     "buy_sell_data_available": tick_df is not None and not tick_df.empty,
                     "tick_data_points": len(tick_df) if tick_df is not None else 0,
@@ -849,28 +858,34 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
         else:
-            # Daily data with specific date support and technical indicators
+            # 🔴 修正：日線資料需要指定日期範圍
             if target_date:
-                # For specific date, get data around that date
-                end_date = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=23, minute=59)))
-                start_date = end_date - timedelta(days=50)
+                # For specific date, get data around that date (50 days before to that date)
+                end_date_str = target_date.strftime('%Y-%m-%d')
+                start_date = target_date - timedelta(days=50)
+                start_date_str = start_date.strftime('%Y-%m-%d')
             else:
-                # For current date, use existing logic
+                # For current date, get last 50 days
                 now_tw = datetime.now(TW_TZ)
-                end_date = now_tw
-                start_date = end_date - timedelta(days=50)
+                end_date_str = now_tw.strftime('%Y-%m-%d')
+                start_date = now_tw.date() - timedelta(days=50)
+                start_date_str = start_date.strftime('%Y-%m-%d')
             
-            logger.info(f"Daily data - Start: {start_date}, End: {end_date}")
+            logger.info(f"Getting daily kbars from {start_date_str} to {end_date_str}")
             
             try:
+                # 🔴 修正：加入 start 和 end 參數
                 kbars = api.kbars(
-                    contract=contract
+                    contract=contract,
+                    start=start_date_str,  # 🔴 加入 start 參數
+                    end=end_date_str,      # 🔴 加入 end 參數
+                    timeout=30000
                 )
                 
                 logger.info(f"Daily raw kbars object type: {type(kbars)}")
                 
                 if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                    return {"success": False, "message": f"No historical data available for {stock_code} around {base_date}"}
+                    return {"success": False, "message": f"No historical data available for {stock_code} from {start_date_str} to {end_date_str}"}
                 
                 try:
                     df = pd.DataFrame({
@@ -882,24 +897,28 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         'Volume': kbars.Volume
                     })
                     
-                    df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                    # 🔴 修正：正確轉換時間戳記（nanosecond to datetime）
+                    df['ts'] = pd.to_datetime(df['ts'], unit='ns')
+                    df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert(TW_TZ)
                     
                     logger.info(f"Daily DataFrame shape: {df.shape}")
                     logger.info(f"Daily DataFrame columns: {df.columns.tolist()}")
+                    logger.info(f"Date range: {df['ts'].min()} to {df['ts'].max()}")
                     
                     if df.empty or len(df) < 5:
                         return {
                             "success": False, 
-                            "message": f"Insufficient historical data for {stock_code} around {base_date}. Got {len(df)} days, need at least 5."
+                            "message": f"Insufficient historical data for {stock_code}. Got {len(df)} days, need at least 5."
                         }
                     
                     # Extract price and volume data from DataFrame
                     close_prices = [float(price) for price in df['Close'].tolist()]
+                    high_prices = [float(price) for price in df['High'].tolist()]
+                    low_prices = [float(price) for price in df['Low'].tolist()]
                     volumes = [int(volume) for volume in df['Volume'].tolist()]
                     
-                    logger.info(f"Extracted close_prices length: {len(close_prices)}")
-                    logger.info(f"Close prices first 5: {close_prices[:5]}")
-                    logger.info(f"Close prices last 5: {close_prices[-5:]}")
+                    logger.info(f"Extracted {len(close_prices)} days of data")
+                    logger.info(f"Close prices - First: {close_prices[0]:.2f}, Last: {close_prices[-1]:.2f}")
                     
                     # 計算技術指標
                     def calculate_ma(prices, period):
@@ -921,12 +940,12 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         
                         return ma, upper_band, lower_band
                     
-                    # 🎯 計算你需要的技術指標
+                    # 計算技術指標
                     ma_20 = calculate_ma(close_prices, min(20, len(close_prices)))
                     ma_40 = calculate_ma(close_prices, min(40, len(close_prices))) if len(close_prices) >= 40 else None
                     bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, min(20, len(close_prices)), 2)
                     
-                    # 🎯 成交量分析
+                    # 成交量分析
                     current_volume = int(volumes[-1]) if volumes else 0
                     avg_volume_5d = calculate_ma(volumes, min(5, len(volumes))) if len(volumes) >= 5 else None
                     avg_volume_20d = calculate_ma(volumes, min(20, len(volumes))) if len(volumes) >= 20 else None
@@ -945,7 +964,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                             else:
                                 trend_signal = "bearish" if current_price < ma_20 else "neutral"
                         else:
-                            # Use only MA20 for trend if MA40 is not available
                             trend_signal = "bullish" if current_price > ma_20 else "bearish"
                     
                     if bb_upper and bb_lower and current_price:
@@ -968,7 +986,8 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         
                         ticks = api.ticks(
                             contract=contract,
-                            date=tick_date.strftime('%Y-%m-%d')
+                            date=tick_date.strftime('%Y-%m-%d'),
+                            timeout=30000
                         )
                         
                         if ticks and hasattr(ticks, 'ts') and ticks.ts:
@@ -982,7 +1001,9 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                 tick_data['tick_type'] = ticks.tick_type
                             
                             tick_df = pd.DataFrame(tick_data)
-                            tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                            # 🔴 修正：正確轉換 tick 時間戳記
+                            tick_df['ts'] = pd.to_datetime(tick_df['ts'], unit='ns')
+                            tick_df['ts'] = tick_df['ts'].dt.tz_localize('UTC').dt.tz_convert(TW_TZ)
                             
                             logger.info(f"Daily tick data shape: {tick_df.shape}")
                             
@@ -1001,37 +1022,39 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                     daily_buy_volume += neutral_volume // 2
                                     daily_sell_volume += neutral_volume - (neutral_volume // 2)
                                     
-                                logger.info(f"Daily buy/sell volume calculated: buy={daily_buy_volume}, sell={daily_sell_volume}")
+                                logger.info(f"Daily buy/sell volume: buy={daily_buy_volume}, sell={daily_sell_volume}")
                         
                     except Exception as tick_error:
                         logger.error(f"Daily tick data error for {stock_code}: {tick_error}")
                         daily_buy_volume = None
                         daily_sell_volume = None
                     
-                    # 🎯 返回完整的技術分析資料
+                    # 返回完整的技術分析資料
                     return {
                         "success": True,
                         "query_date": base_date.strftime('%Y-%m-%d'),
+                        "data_range": f"{df['ts'].min().strftime('%Y-%m-%d')} to {df['ts'].max().strftime('%Y-%m-%d')}",
                         "current_price": current_price,
                         "technical_indicators": {
-                            "ma_20": round(ma_20, 2) if ma_20 else None,  # 🎯 20日均線
-                            "ma_40": round(ma_40, 2) if ma_40 else None,  # 🎯 40日均線
+                            "ma_20": round(ma_20, 2) if ma_20 else None,
+                            "ma_40": round(ma_40, 2) if ma_40 else None,
                             "ma_40_available": ma_40 is not None,
                             "bollinger_bands": {
-                                "middle": round(bb_ma, 2) if bb_ma else None,     # 布林中軌 (20MA)
-                                "upper": round(bb_upper, 2) if bb_upper else None, # 🎯 布林上軌
-                                "lower": round(bb_lower, 2) if bb_lower else None, # 🎯 布林下軌
+                                "middle": round(bb_ma, 2) if bb_ma else None,
+                                "upper": round(bb_upper, 2) if bb_upper else None,
+                                "lower": round(bb_lower, 2) if bb_lower else None,
                                 "signal": bb_signal
                             }
                         },
                         "volume_analysis": {
-                            "current_volume": current_volume,                      # 🎯 當日成交量
-                            "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,  # 🎯 5日平均成交量
-                            "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None, # 20日平均成交量
+                            "current_volume": current_volume,
+                            "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,
+                            "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None,
                             "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None,
                             "daily_buy_volume": daily_buy_volume,
                             "daily_sell_volume": daily_sell_volume,
-                            "buy_sell_ratio": round(daily_buy_volume / daily_sell_volume, 2) if daily_buy_volume and daily_sell_volume and daily_sell_volume > 0 else None
+                            "buy_sell_ratio": round(daily_buy_volume / daily_sell_volume, 2) if daily_buy_volume and daily_sell_volume and daily_sell_volume > 0 else None,
+                            "net_flow": daily_buy_volume - daily_sell_volume if daily_buy_volume is not None and daily_sell_volume is not None else None
                         },
                         "signals": {
                             "trend": trend_signal,
@@ -1049,7 +1072,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             except Exception as e:
                 logger.error(f"Error getting daily data for {stock_code}: {e}")
                 return {"success": False, "message": f"Daily data error: {str(e)}"}
-        
         
     except Exception as e:
         logger.error(f"Overall error for {stock_code}: {e}")
