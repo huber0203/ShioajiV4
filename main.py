@@ -1382,8 +1382,17 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     "last_update": df.iloc[-1]['ts'].strftime('%Y-%m-%d %H:%M:%S') if not df.empty else None,
                     "timezone": "Asia/Taipei (+8)"
                 }
-
-    logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
+                
+            except Exception as df_error:
+                logger.error(f"Error processing daily data for {stock_code}: {df_error}")
+                return {"success": False, "message": f"Daily data processing error: {str(df_error)}"}
+        
+        except Exception as e:
+            logger.error(f"Error getting daily data for {stock_code}: {e}")
+            return {"success": False, "message": f"Daily data error: {str(e)}"}
+    
+    finally:
+        logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
 
 @app.get("/health")
 async def health_check():
