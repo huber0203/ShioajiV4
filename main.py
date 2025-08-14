@@ -1390,9 +1390,9 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
         except Exception as e:
             logger.error(f"Error getting daily data for {stock_code}: {e}")
             return {"success": False, "message": f"Daily data error: {str(e)}"}
-    
-    finally:
-        logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
+        
+        finally:
+            logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
 
 @app.get("/health")
 async def health_check():
