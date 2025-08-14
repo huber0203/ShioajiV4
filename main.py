@@ -1309,3 +1309,461 @@ async def get_historical_analysis(
         kbars = api.kbars(
             contract=contract,
             start=date,
+            end=date,
+            timeout=30000
+        )
+        
+        if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+            return {"success": False, "message": f"No K-bar data available for {stock_code} on {date}"}
+        
+        # 轉換 K 線資料為 DataFrame
+        kbar_df = pd.DataFrame({
+            'ts': kbars.ts,
+            'Open': kbars.Open,
+            'High': kbars.High,
+            'Low': kbars.Low,
+            'Close': kbars.Close,
+            'Volume': kbars.Volume
+        })
+        
+        kbar_df['ts'] = pd.to_datetime(kbar_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+        kbar_df.set_index('ts', inplace=True)
+        
+        logger.info(f"✅ 取得 {len(kbar_df)} 根 1 分鐘 K 線")
+        
+        # 3. 重新採樣 K 線到指定間隔
+        logger.info(f"🔄 Step 3: 重新採樣 K 線到 {interval} 間隔...")
+        
+        interval_map = {
+            '1min': '1T',
+            '5min': '5T',
+            '15min': '15T',
+            '30min': '30T',
+            '60min': '60T'
+        }
+        
+        if interval != '1min':
+            resampled_kbar = kbar_df.resample(interval_map[interval], label='right', closed='right').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+            resampled_kbar.reset_index(inplace=True)
+        else:
+            resampled_kbar = kbar_df.reset_index()
+        
+        logger.info(f"✅ 產生 {len(resampled_kbar)} 根 {interval} K 線")
+        
+        # 4. 分析買賣力道
+        logger.info(f"🔄 Step 4: 分析買賣力道...")
+        
+        analysis_results = []
+        
+        for idx, kbar in resampled_kbar.iterrows():
+            # 找出這根 K 線時間範圍內的所有 Ticks
+            if idx == 0:
+                interval_start = kbar['ts'] - pd.Timedelta(interval_map[interval])
+            else:
+                interval_start = resampled_kbar.iloc[idx-1]['ts']
+            interval_end = kbar['ts']
+            
+            interval_ticks = tick_df[
+                (tick_df['ts'] > interval_start) & 
+                (tick_df['ts'] <= interval_end)
+            ]
+            
+            # 計算買賣量
+            buy_volume = 0
+            sell_volume = 0
+            neutral_volume = 0
+            
+            if not interval_ticks.empty:
+                if 'tick_type' in interval_ticks.columns:
+                    buy_volume = int(interval_ticks[interval_ticks['tick_type'] == 1]['volume'].sum())
+                    sell_volume = int(interval_ticks[interval_ticks['tick_type'] == 2]['volume'].sum())
+                    neutral_volume = int(interval_ticks[interval_ticks['tick_type'] == 0]['volume'].sum())
+                else:
+                    # 使用價格判斷法
+                    avg_price = (kbar['Open'] + kbar['High'] + kbar['Low'] + kbar['Close']) / 4
+                    buy_volume = int(interval_ticks[interval_ticks['close'] >= avg_price]['volume'].sum())
+                    sell_volume = int(interval_ticks[interval_ticks['close'] < avg_price]['volume'].sum())
+            
+            # 計算技術指標
+            price_range = float(kbar['High'] - kbar['Low'])
+            body_size = abs(float(kbar['Close'] - kbar['Open']))
+            upper_shadow = float(kbar['High'] - max(kbar['Open'], kbar['Close']))
+            lower_shadow = float(min(kbar['Open'], kbar['Close']) - kbar['Low'])
+            
+            bar_analysis = {
+                "time": kbar['ts'].strftime('%H:%M'),
+                "datetime": kbar['ts'].strftime('%Y-%m-%d %H:%M:%S'),
+                "ohlc": {
+                    "open": float(kbar['Open']),
+                    "high": float(kbar['High']),
+                    "low": float(kbar['Low']),
+                    "close": float(kbar['Close'])
+                },
+                "volume_analysis": {
+                    "total": int(kbar['Volume']),
+                    "buy": buy_volume,
+                    "sell": sell_volume,
+                    "neutral": neutral_volume,
+                    "buy_ratio": round(buy_volume / kbar['Volume'] * 100, 2) if kbar['Volume'] > 0 else 0,
+                    "sell_ratio": round(sell_volume / kbar['Volume'] * 100, 2) if kbar['Volume'] > 0 else 0,
+                    "net_flow": buy_volume - sell_volume,
+                    "buy_sell_ratio": round(buy_volume / sell_volume, 2) if sell_volume > 0 else None
+                },
+                "price_analysis": {
+                    "change": round(float(kbar['Close'] - kbar['Open']), 2),
+                    "change_pct": round((kbar['Close'] - kbar['Open']) / kbar['Open'] * 100, 2) if kbar['Open'] != 0 else 0,
+                    "average": round((kbar['Open'] + kbar['High'] + kbar['Low'] + kbar['Close']) / 4, 2),
+                    "range": round(price_range, 2),
+                    "body_size": round(body_size, 2),
+                    "upper_shadow": round(upper_shadow, 2),
+                    "lower_shadow": round(lower_shadow, 2),
+                    "body_ratio": round(body_size / price_range * 100, 2) if price_range > 0 else 0
+                },
+                "tick_count": len(interval_ticks),
+                "trend": "bullish" if kbar['Close'] > kbar['Open'] else "bearish" if kbar['Close'] < kbar['Open'] else "neutral"
+            }
+            
+            analysis_results.append(bar_analysis)
+        
+        # 5. 計算整體統計
+        logger.info(f"🔄 Step 5: 計算整體統計...")
+        
+        total_buy = sum(bar['volume_analysis']['buy'] for bar in analysis_results)
+        total_sell = sum(bar['volume_analysis']['sell'] for bar in analysis_results)
+        total_neutral = sum(bar['volume_analysis']['neutral'] for bar in analysis_results)
+        
+        overall_summary = {
+            "date": date,
+            "interval": interval,
+            "total_bars": len(analysis_results),
+            "total_ticks": len(tick_df),
+            "price_summary": {
+                "open": float(resampled_kbar.iloc[0]['Open']) if len(resampled_kbar) > 0 else None,
+                "close": float(resampled_kbar.iloc[-1]['Close']) if len(resampled_kbar) > 0 else None,
+                "high": float(resampled_kbar['High'].max()),
+                "low": float(resampled_kbar['Low'].min()),
+                "change": float(resampled_kbar.iloc[-1]['Close'] - resampled_kbar.iloc[0]['Open']) if len(resampled_kbar) > 0 else None,
+                "change_pct": round((resampled_kbar.iloc[-1]['Close'] - resampled_kbar.iloc[0]['Open']) / resampled_kbar.iloc[0]['Open'] * 100, 2) if len(resampled_kbar) > 0 and resampled_kbar.iloc[0]['Open'] != 0 else None
+            },
+            "volume_summary": {
+                "total": int(resampled_kbar['Volume'].sum()),
+                "buy": total_buy,
+                "sell": total_sell,
+                "neutral": total_neutral,
+                "buy_ratio": round(total_buy / resampled_kbar['Volume'].sum() * 100, 2) if resampled_kbar['Volume'].sum() > 0 else 0,
+                "sell_ratio": round(total_sell / resampled_kbar['Volume'].sum() * 100, 2) if resampled_kbar['Volume'].sum() > 0 else 0,
+                "net_flow": total_buy - total_sell,
+                "buy_sell_ratio": round(total_buy / total_sell, 2) if total_sell > 0 else None
+            },
+            "time_range": {
+                "start": tick_df['ts'].min().strftime('%Y-%m-%d %H:%M:%S'),
+                "end": tick_df['ts'].max().strftime('%Y-%m-%d %H:%M:%S')
+            }
+        }
+        
+        # 記錄分析摘要
+        logger.info(f"📊 分析完成摘要:")
+        logger.info(f"   - 總成交量: {overall_summary['volume_summary']['total']:,} 張")
+        logger.info(f"   - 買入量: {overall_summary['volume_summary']['buy']:,} 張 ({overall_summary['volume_summary']['buy_ratio']:.2f}%)")
+        logger.info(f"   - 賣出量: {overall_summary['volume_summary']['sell']:,} 張 ({overall_summary['volume_summary']['sell_ratio']:.2f}%)")
+        logger.info(f"   - 淨流入: {overall_summary['volume_summary']['net_flow']:,} 張")
+        if overall_summary['price_summary']['change'] is not None:
+            logger.info(f"   - 價格變化: {overall_summary['price_summary']['change']:.2f} ({overall_summary['price_summary']['change_pct']:.2f}%)")
+        
+        logger.info(f"✅ 歷史資料分析完成")
+        logger.info("="*60)
+        
+        return {
+            "success": True,
+            "stock_code": stock_code,
+            "stock_name": contract.name,
+            "summary": overall_summary,
+            "detailed_analysis": analysis_results,
+            "timezone": "Asia/Taipei (+8)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 錯誤發生: {e}")
+        logger.error(f"   錯誤類型: {type(e).__name__}")
+        logger.error(f"   Stack trace:\n{traceback.format_exc()}")
+        return {"success": False, "message": f"Error: {str(e)}"}
+        
+        if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+            return {"success": False, "message": f"No K-bar data available for {stock_code} on {date}"}
+        
+        # 轉換 K 線資料為 DataFrame
+        kbar_df = pd.DataFrame({
+            'ts': kbars.ts,
+            'Open': kbars.Open,
+            'High': kbars.High,
+            'Low': kbars.Low,
+            'Close': kbars.Close,
+            'Volume': kbars.Volume
+        })
+        
+        kbar_df['ts'] = pd.to_datetime(kbar_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+        kbar_df.set_index('ts', inplace=True)
+        
+        logger.info(f"✅ 取得 {len(kbar_df)} 根 1 分鐘 K 線")
+        
+        # 3. 重新採樣 K 線到指定間隔
+        logger.info(f"🔄 Step 3: 重新採樣 K 線到 {interval} 間隔...")
+        
+        interval_map = {
+            '1min': '1T',
+            '5min': '5T',
+            '15min': '15T',
+            '30min': '30T',
+            '60min': '60T'
+        }
+        
+        if interval != '1min':
+            resampled_kbar = kbar_df.resample(interval_map[interval], label='right', closed='right').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+            resampled_kbar.reset_index(inplace=True)
+        else:
+            resampled_kbar = kbar_df.reset_index()
+        
+        logger.info(f"✅ 產生 {len(resampled_kbar)} 根 {interval} K 線")
+        
+        # 4. 分析買賣力道
+        logger.info(f"🔄 Step 4: 分析買賣力道...")
+        
+        analysis_results = []
+        
+        for idx, kbar in resampled_kbar.iterrows():
+            # 找出這根 K 線時間範圍內的所有 Ticks
+            if idx == 0:
+                interval_start = kbar['ts'] - pd.Timedelta(interval_map[interval])
+            else:
+                interval_start = resampled_kbar.iloc[idx-1]['ts']
+            interval_end = kbar['ts']
+            
+            interval_ticks = tick_df[
+                (tick_df['ts'] > interval_start) & 
+                (tick_df['ts'] <= interval_end)
+            ]
+            
+            # 計算買賣量
+            buy_volume = 0
+            sell_volume = 0
+            neutral_volume = 0
+            
+            if not interval_ticks.empty:
+                if 'tick_type' in interval_ticks.columns:
+                    buy_volume = int(interval_ticks[interval_ticks['tick_type'] == 1]['volume'].sum())
+                    sell_volume = int(interval_ticks[interval_ticks['tick_type'] == 2]['volume'].sum())
+                    neutral_volume = int(interval_ticks[interval_ticks['tick_type'] == 0]['volume'].sum())
+                else:
+                    # 使用價格判斷法
+                    avg_price = (kbar['Open'] + kbar['High'] + kbar['Low'] + kbar['Close']) / 4
+                    buy_volume = int(interval_ticks[interval_ticks['close'] >= avg_price]['volume'].sum())
+                    sell_volume = int(interval_ticks[interval_ticks['close'] < avg_price]['volume'].sum())
+            
+            # 計算技術指標
+            price_range = float(kbar['High'] - kbar['Low'])
+            body_size = abs(float(kbar['Close'] - kbar['Open']))
+            upper_shadow = float(kbar['High'] - max(kbar['Open'], kbar['Close']))
+            lower_shadow = float(min(kbar['Open'], kbar['Close']) - kbar['Low'])
+            
+            bar_analysis = {
+                "time": kbar['ts'].strftime('%H:%M'),
+                "datetime": kbar['ts'].strftime('%Y-%m-%d %H:%M:%S'),
+                "ohlc": {
+                    "open": float(kbar['Open']),
+                    "high": float(kbar['High']),
+                    "low": float(kbar['Low']),
+                    "close": float(kbar['Close'])
+                },
+                "volume_analysis": {
+                    "total": int(kbar['Volume']),
+                    "buy": buy_volume,
+                    "sell": sell_volume,
+                    "neutral": neutral_volume,
+                    "buy_ratio": round(buy_volume / kbar['Volume'] * 100, 2) if kbar['Volume'] > 0 else 0,
+                    "sell_ratio": round(sell_volume / kbar['Volume'] * 100, 2) if kbar['Volume'] > 0 else 0,
+                    "net_flow": buy_volume - sell_volume,
+                    "buy_sell_ratio": round(buy_volume / sell_volume, 2) if sell_volume > 0 else None
+                },
+                "price_analysis": {
+                    "change": round(float(kbar['Close'] - kbar['Open']), 2),
+                    "change_pct": round((kbar['Close'] - kbar['Open']) / kbar['Open'] * 100, 2) if kbar['Open'] != 0 else 0,
+                    "average": round((kbar['Open'] + kbar['High'] + kbar['Low'] + kbar['Close']) / 4, 2),
+                    "range": round(price_range, 2),
+                    "body_size": round(body_size, 2),
+                    "upper_shadow": round(upper_shadow, 2),
+                    "lower_shadow": round(lower_shadow, 2),
+                    "body_ratio": round(body_size / price_range * 100, 2) if price_range > 0 else 0
+                },
+                "tick_count": len(interval_ticks),
+                "trend": "bullish" if kbar['Close'] > kbar['Open'] else "bearish" if kbar['Close'] < kbar['Open'] else "neutral"
+            }
+            
+            analysis_results.append(bar_analysis)
+        
+        # 5. 計算整體統計
+        logger.info(f"🔄 Step 5: 計算整體統計...")
+        
+        total_buy = sum(bar['volume_analysis']['buy'] for bar in analysis_results)
+        total_sell = sum(bar['volume_analysis']['sell'] for bar in analysis_results)
+        total_neutral = sum(bar['volume_analysis']['neutral'] for bar in analysis_results)
+        
+        overall_summary = {
+            "date": date,
+            "interval": interval,
+            "total_bars": len(analysis_results),
+            "total_ticks": len(tick_df),
+            "price_summary": {
+                "open": float(resampled_kbar.iloc[0]['Open']) if len(resampled_kbar) > 0 else None,
+                "close": float(resampled_kbar.iloc[-1]['Close']) if len(resampled_kbar) > 0 else None,
+                "high": float(resampled_kbar['High'].max()),
+                "low": float(resampled_kbar['Low'].min()),
+                "change": float(resampled_kbar.iloc[-1]['Close'] - resampled_kbar.iloc[0]['Open']) if len(resampled_kbar) > 0 else None,
+                "change_pct": round((resampled_kbar.iloc[-1]['Close'] - resampled_kbar.iloc[0]['Open']) / resampled_kbar.iloc[0]['Open'] * 100, 2) if len(resampled_kbar) > 0 and resampled_kbar.iloc[0]['Open'] != 0 else None
+            },
+            "volume_summary": {
+                "total": int(resampled_kbar['Volume'].sum()),
+                "buy": total_buy,
+                "sell": total_sell,
+                "neutral": total_neutral,
+                "buy_ratio": round(total_buy / resampled_kbar['Volume'].sum() * 100, 2) if resampled_kbar['Volume'].sum() > 0 else 0,
+                "sell_ratio": round(total_sell / resampled_kbar['Volume'].sum() * 100, 2) if resampled_kbar['Volume'].sum() > 0 else 0,
+                "net_flow": total_buy - total_sell,
+                "buy_sell_ratio": round(total_buy / total_sell, 2) if total_sell > 0 else None
+            },
+            "time_range": {
+                "start": tick_df['ts'].min().strftime('%Y-%m-%d %H:%M:%S'),
+                "end": tick_df['ts'].max().strftime('%Y-%m-%d %H:%M:%S')
+            }
+        }
+        
+        # 記錄分析摘要
+        logger.info(f"📊 分析完成摘要:")
+        logger.info(f"   - 總成交量: {overall_summary['volume_summary']['total']:,} 張")
+        logger.info(f"   - 買入量: {overall_summary['volume_summary']['buy']:,} 張 ({overall_summary['volume_summary']['buy_ratio']:.2f}%)")
+        logger.info(f"   - 賣出量: {overall_summary['volume_summary']['sell']:,} 張 ({overall_summary['volume_summary']['sell_ratio']:.2f}%)")
+        logger.info(f"   - 淨流入: {overall_summary['volume_summary']['net_flow']:,} 張")
+        if overall_summary['price_summary']['change'] is not None:
+            logger.info(f"   - 價格變化: {overall_summary['price_summary']['change']:.2f} ({overall_summary['price_summary']['change_pct']:.2f}%)")
+        
+        logger.info(f"✅ 歷史資料分析完成")
+        logger.info("="*60)
+        
+        return {
+            "success": True,
+            "stock_code": stock_code,
+            "stock_name": contract.name,
+            "summary": overall_summary,
+            "detailed_analysis": analysis_results,
+            "timezone": "Asia/Taipei (+8)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 錯誤發生: {e}")
+        logger.error(f"   錯誤類型: {type(e).__name__}")
+        logger.error(f"   Stack trace:\n{traceback.format_exc()}")
+        return {"success": False, "message": f"Error: {str(e)}"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    actual_connected = check_connection()
+    current_time_tw = datetime.now(TW_TZ)
+    return {
+        "status": "healthy",
+        "api_connected": actual_connected,
+        "login_status_var": login_status,
+        "auto_login_configured": bool(os.getenv("SHIOAJI_API_KEY") and os.getenv("SHIOAJI_SECRET_KEY")),
+        "current_time_tw": current_time_tw.strftime('%Y-%m-%d %H:%M:%S'),
+        "timezone": "Asia/Taipei (+8)",
+        "timestamp": str(datetime.now())
+    }
+
+@app.post("/retry-login")
+async def retry_auto_login():
+    """Retry auto-login using environment variables"""
+    global api, login_status
+    try:
+        if not api:
+            api = sj.Shioaji()
+            
+        api_key = os.getenv("SHIOAJI_API_KEY")
+        secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+        
+        if not api_key or not secret_key:
+            return {
+                "success": False,
+                "message": "Environment variables not set",
+                "env_check": {
+                    "SHIOAJI_API_KEY": "SET" if api_key else "NOT SET",
+                    "SHIOAJI_SECRET_KEY": "SET" if secret_key else "NOT SET",
+                    "SHIOAJI_PERSON_ID": "SET" if os.getenv("SHIOAJI_PERSON_ID") else "NOT SET"
+                }
+            }
+        
+        logger.info(f"Retry - API Key length: {len(api_key)}")
+        logger.info(f"Retry - Secret Key length: {len(secret_key)}")
+        
+        api_key_clean = api_key.strip().strip('"').strip("'")
+        secret_key_clean = secret_key.strip().strip('"').strip("'")
+        
+        logger.info(f"Retry - Cleaned API Key length: {len(api_key_clean)}")
+        logger.info(f"Retry - Cleaned Secret Key length: {len(secret_key_clean)}")
+        
+        login_attempts = [
+            (api_key_clean, secret_key_clean, "original"),
+            (api_key_clean.encode('utf-8').decode('unicode_escape'), 
+             secret_key_clean.encode('utf-8').decode('unicode_escape'), "unicode_escape"),
+        ]
+        
+        for api_key_attempt, secret_key_attempt, method in login_attempts:
+            try:
+                logger.info(f"Retrying login with method: {method}")
+                accounts = api.login(
+                    api_key=api_key_attempt,
+                    secret_key=secret_key_attempt,
+                    fetch_contract=True,
+                    subscribe_trade=True
+                )
+                
+                if accounts:
+                    login_status = True
+                    return {
+                        "success": True,
+                        "message": f"Auto-login retry successful with method: {method}",
+                        "accounts": [acc.account_id for acc in accounts],
+                        "stock_account": api.stock_account.account_id if api.stock_account else None,
+                        "futopt_account": api.futopt_account.account_id if api.futopt_account else None
+                    }
+                    
+            except Exception as e:
+                logger.warning(f"Login retry with {method} failed: {e}")
+                continue
+        
+        login_status = False
+        return {
+            "success": False,
+            "message": "All login retry attempts failed"
+        }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Retry login error: {str(e)}"
+        }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
