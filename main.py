@@ -14,13 +14,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Shioaji Trading API",
-    description="Official Shioaji Trading API for n8n integration with auto-login",
+    description="Trading API with technical indicators using Shioaji",
     version="1.0.0"
 )
 
 # Global Shioaji API instance
 api = None
 login_status = False
+account_info = None
 
 # Taiwan timezone
 TW_TZ = pytz.timezone('Asia/Taipei')
@@ -46,6 +47,23 @@ class OrderResponse(BaseModel):
     success: bool
     message: str
     order_id: Optional[str] = None
+
+class HealthResponse(BaseModel):
+    status: str
+    message: str
+    login_status: bool
+    current_time: str
+    timezone: str
+
+class QuoteResponse(BaseModel):
+    success: bool
+    code: str
+    name: str
+    price: float
+    change: float
+    change_percent: float
+    volume: int
+    timestamp: str
 
 @app.on_event("startup")
 async def startup_event():
@@ -545,37 +563,10 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
         base_date = now_tw.date()
     
     if timeframe == "5min":
-        # Get intraday 1-minute data with session control for specific date
-        
-        if session == "morning":
-            # Morning session (早盤): 09:00 - 13:30 Taiwan time
-            start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=9, minute=0)))
-            end_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=13, minute=30)))
-            session_name = "早盤 (Morning Session)"
-        elif session == "night":
-            # Night session (夜盤): 15:00 - 05:00 next day Taiwan time
-            if target_date:
-                # For specific date, always get that date's night session
-                tomorrow = base_date + timedelta(days=1)
-                start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=15, minute=0)))
-                end_time = TW_TZ.localize(datetime.combine(tomorrow, datetime.min.time().replace(hour=5, minute=0)))
-            else:
-                # For current date, use existing logic
-                if now_tw.hour < 15:
-                    # Get previous day's night session (15:00 yesterday - 05:00 today)
-                    yesterday = base_date - timedelta(days=1)
-                    start_time = TW_TZ.localize(datetime.combine(yesterday, datetime.min.time().replace(hour=15, minute=0)))
-                    end_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=5, minute=0)))
-                else:
-                    # Get today's night session (15:00 today - 05:00 tomorrow)
-                    tomorrow = base_date + timedelta(days=1)
-                    start_time = TW_TZ.localize(datetime.combine(base_date, datetime.min.time().replace(hour=15, minute=0)))
-                    end_time = TW_TZ.localize(datetime.combine(tomorrow, datetime.min.time().replace(hour=5, minute=0)))
-            session_name = "夜盤 (Night Session)"
-        
-        logger.info(f"Time range: {start_time} to {end_time}")
+        # Get intraday 1-minute data - use broader time range to capture available data
         
         try:
+            # First, get all available recent data
             kbars = api.kbars(
                 contract=contract,
                 timeout=30000
@@ -610,7 +601,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             
             if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
                 logger.info(f"No kbars data available - kbars: {kbars}, has ts: {hasattr(kbars, 'ts') if kbars else False}")
-                return {"success": False, "message": f"No {session} session data available for {stock_code} on {base_date}"}
+                return {"success": False, "message": f"No intraday data available for {stock_code}"}
             
             try:
                 # Convert kbars to DataFrame properly
@@ -632,20 +623,42 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
                 
                 logger.info(f"After timezone conversion - first 3 timestamps: {df['ts'].head(3).tolist()}")
+                logger.info(f"After timezone conversion - last 3 timestamps: {df['ts'].tail(3).tolist()}")
                 
-                df = df[(df['ts'] >= start_time) & (df['ts'] <= end_time)]
+                if session == "morning":
+                    # Morning session (早盤): 09:00 - 13:30 Taiwan time
+                    session_name = "早盤 (Morning Session)"
+                    # Filter for morning hours (9-13)
+                    df_session = df[df['ts'].dt.hour.between(9, 13)]
+                    # Also include 13:30 data
+                    df_1330 = df[(df['ts'].dt.hour == 13) & (df['ts'].dt.minute <= 30)]
+                    df_session = pd.concat([df_session, df_1330]).drop_duplicates().sort_values('ts')
+                    
+                elif session == "night":
+                    # Night session (夜盤): 15:00 - 05:00 next day Taiwan time
+                    session_name = "夜盤 (Night Session)"
+                    # Filter for night hours (15-23 and 0-5)
+                    df_night1 = df[df['ts'].dt.hour >= 15]  # 15:00-23:59
+                    df_night2 = df[df['ts'].dt.hour <= 5]   # 00:00-05:00
+                    df_session = pd.concat([df_night1, df_night2]).drop_duplicates().sort_values('ts')
                 
-                logger.info(f"After time filtering - DataFrame shape: {df.shape}")
-                logger.info(f"Time range filter: {start_time} to {end_time}")
+                logger.info(f"After session filtering ({session}) - DataFrame shape: {df_session.shape}")
                 
-                if df.empty:
-                    return {"success": False, "message": f"No {session} session data available for {stock_code} on {base_date} in specified time range"}
+                if df_session.empty:
+                    available_start = df['ts'].min().strftime('%H:%M') if not df.empty else "N/A"
+                    available_end = df['ts'].max().strftime('%H:%M') if not df.empty else "N/A"
+                    return {
+                        "success": False, 
+                        "message": f"No {session} session data available for {stock_code}. Available data time range: {available_start} - {available_end}",
+                        "available_data_range": f"{available_start} - {available_end}",
+                        "requested_session": session_name
+                    }
                 
                 # Set timestamp as index for resampling
-                df.set_index('ts', inplace=True)
+                df_session.set_index('ts', inplace=True)
                 
                 # Resample to 5-minute bars
-                df_5min = df.resample('5T', label='right', closed='right').agg({
+                df_5min = df_session.resample('5T', label='right', closed='right').agg({
                     'Open': 'first',
                     'High': 'max',
                     'Low': 'min',
