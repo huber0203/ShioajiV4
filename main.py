@@ -1690,6 +1690,417 @@ async def health_check():
         "timestamp": str(datetime.now())
     }
 
+
+@app.get("/historical/daily/{stock_codes}")
+async def get_historical_daily_kbars(
+    stock_codes: str,
+    days: int = 7,
+    end_date: str = None
+):
+    """
+    取得多檔股票的歷史日K線資料
+    
+    Args:
+        stock_codes: 單一或多個股票代碼，逗號分隔 (例如: "2330" 或 "2330,2454,2317")
+        days: 要查詢的天數 (預設7天)
+        end_date: 結束日期 (YYYY-MM-DD格式)，預設為今天
+    
+    Examples:
+        # 單一股票最近7天
+        GET /historical/daily/2330
+        
+        # 單一股票最近30天
+        GET /historical/daily/2330?days=30
+        
+        # 多檔股票最近7天
+        GET /historical/daily/2330,2454,2317
+        
+        # 指定結束日期往前推7天
+        GET /historical/daily/2330?days=7&end_date=2024-12-15
+        
+        # 多檔股票指定日期範圍
+        GET /historical/daily/2330,2454,2317?days=14&end_date=2024-12-15
+    """
+    global api
+    
+    logger.info("="*60)
+    logger.info(f"📊 開始查詢歷史日K線資料")
+    logger.info("="*60)
+    
+    try:
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
+        
+        # 解析股票代碼
+        stock_list = [code.strip() for code in stock_codes.split(',')]
+        logger.info(f"📌 查詢股票: {stock_list}")
+        
+        # 處理日期
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                return {"success": False, "message": "Invalid date format. Use YYYY-MM-DD"}
+        else:
+            end_dt = datetime.now(TW_TZ).replace(tzinfo=None)
+        
+        start_dt = end_dt - timedelta(days=days-1)
+        
+        start_date_str = start_dt.strftime('%Y-%m-%d')
+        end_date_str = end_dt.strftime('%Y-%m-%d')
+        
+        logger.info(f"📌 查詢期間: {start_date_str} ~ {end_date_str} (共{days}天)")
+        
+        # 儲存所有股票的結果
+        all_results = {}
+        
+        for stock_code in stock_list:
+            logger.info(f"🔄 處理 {stock_code}...")
+            
+            # 取得合約
+            contract = api.Contracts.Stocks.get(stock_code)
+            if not contract:
+                all_results[stock_code] = {
+                    "success": False,
+                    "message": f"Stock {stock_code} not found"
+                }
+                continue
+            
+            try:
+                # 取得K線資料
+                kbars = api.kbars(
+                    contract=contract,
+                    start=start_date_str,
+                    end=end_date_str,
+                    timeout=30000
+                )
+                
+                if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+                    all_results[stock_code] = {
+                        "success": False,
+                        "message": f"No data available for {stock_code}"
+                    }
+                    continue
+                
+                # 轉換為DataFrame
+                df = pd.DataFrame({
+                    'ts': kbars.ts,
+                    'Open': kbars.Open,
+                    'High': kbars.High,
+                    'Low': kbars.Low,
+                    'Close': kbars.Close,
+                    'Volume': kbars.Volume
+                })
+                
+                df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                df['date'] = df['ts'].dt.date
+                
+                # 聚合為日K線
+                daily_df = df.groupby('date').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).reset_index()
+                
+                logger.info(f"✅ {stock_code}: 取得 {len(daily_df)} 根日K線")
+                
+                # 準備日K線資料
+                daily_bars = []
+                for idx, row in daily_df.iterrows():
+                    # 計算技術指標
+                    change = row['Close'] - row['Open']
+                    change_pct = (change / row['Open'] * 100) if row['Open'] != 0 else 0
+                    amplitude = ((row['High'] - row['Low']) / row['Low'] * 100) if row['Low'] != 0 else 0
+                    
+                    daily_bar = {
+                        "date": row['date'].strftime('%Y-%m-%d'),
+                        "weekday": ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][row['date'].weekday()],
+                        "open": float(row['Open']),
+                        "high": float(row['High']),
+                        "low": float(row['Low']),
+                        "close": float(row['Close']),
+                        "volume": int(row['Volume']),
+                        "change": round(float(change), 2),
+                        "change_pct": round(float(change_pct), 2),
+                        "amplitude": round(float(amplitude), 2),
+                        "average": round((row['Open'] + row['High'] + row['Low'] + row['Close']) / 4, 2),
+                        "trend": "up" if change > 0 else "down" if change < 0 else "flat"
+                    }
+                    daily_bars.append(daily_bar)
+                
+                # 計算統計摘要
+                total_volume = daily_df['Volume'].sum()
+                avg_volume = daily_df['Volume'].mean()
+                highest_price = daily_df['High'].max()
+                lowest_price = daily_df['Low'].min()
+                
+                # 計算整體漲跌
+                if len(daily_df) > 0:
+                    period_change = daily_df.iloc[-1]['Close'] - daily_df.iloc[0]['Open']
+                    period_change_pct = (period_change / daily_df.iloc[0]['Open'] * 100) if daily_df.iloc[0]['Open'] != 0 else 0
+                else:
+                    period_change = 0
+                    period_change_pct = 0
+                
+                # 計算上漲和下跌天數
+                up_days = sum(1 for bar in daily_bars if bar['trend'] == 'up')
+                down_days = sum(1 for bar in daily_bars if bar['trend'] == 'down')
+                flat_days = sum(1 for bar in daily_bars if bar['trend'] == 'flat')
+                
+                all_results[stock_code] = {
+                    "success": True,
+                    "name": contract.name,
+                    "period": {
+                        "start": start_date_str,
+                        "end": end_date_str,
+                        "days_requested": days,
+                        "days_returned": len(daily_bars)
+                    },
+                    "summary": {
+                        "total_volume": int(total_volume),
+                        "avg_daily_volume": int(avg_volume),
+                        "highest": float(highest_price),
+                        "lowest": float(lowest_price),
+                        "price_range": round(float(highest_price - lowest_price), 2),
+                        "period_change": round(float(period_change), 2),
+                        "period_change_pct": round(float(period_change_pct), 2),
+                        "up_days": up_days,
+                        "down_days": down_days,
+                        "flat_days": flat_days,
+                        "win_rate": round(up_days / len(daily_bars) * 100, 2) if len(daily_bars) > 0 else 0
+                    },
+                    "daily_bars": daily_bars
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing {stock_code}: {e}")
+                all_results[stock_code] = {
+                    "success": False,
+                    "message": f"Error: {str(e)}"
+                }
+        
+        # 準備回傳結果
+        successful_stocks = [code for code in all_results if all_results[code].get('success', False)]
+        failed_stocks = [code for code in all_results if not all_results[code].get('success', False)]
+        
+        logger.info(f"📊 查詢完成: 成功 {len(successful_stocks)} 檔, 失敗 {len(failed_stocks)} 檔")
+        logger.info("="*60)
+        
+        return {
+            "success": True,
+            "query": {
+                "stocks": stock_list,
+                "period": f"{start_date_str} ~ {end_date_str}",
+                "days": days,
+                "total_stocks": len(stock_list),
+                "successful": len(successful_stocks),
+                "failed": len(failed_stocks)
+            },
+            "results": all_results,
+            "timestamp": datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            "timezone": "Asia/Taipei (+8)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 錯誤發生: {e}")
+        logger.error(f"   Stack trace:\n{traceback.format_exc()}")
+        return {"success": False, "message": f"Error: {str(e)}"}
+
+
+@app.get("/historical/compare/{stock_codes}")
+async def compare_stocks_performance(
+    stock_codes: str,
+    days: int = 30,
+    end_date: str = None
+):
+    """
+    比較多檔股票的歷史表現
+    
+    Args:
+        stock_codes: 多個股票代碼，逗號分隔
+        days: 比較天數
+        end_date: 結束日期
+    
+    Examples:
+        # 比較最近30天表現
+        GET /historical/compare/2330,2454,2317
+        
+        # 比較特定期間
+        GET /historical/compare/2330,2454,2317?days=60&end_date=2024-12-15
+    """
+    global api
+    
+    logger.info("="*60)
+    logger.info(f"📊 開始比較股票歷史表現")
+    logger.info("="*60)
+    
+    try:
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
+        
+        # 解析股票代碼
+        stock_list = [code.strip() for code in stock_codes.split(',')]
+        
+        if len(stock_list) < 2:
+            return {"success": False, "message": "Please provide at least 2 stocks for comparison"}
+        
+        # 處理日期
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                return {"success": False, "message": "Invalid date format. Use YYYY-MM-DD"}
+        else:
+            end_dt = datetime.now(TW_TZ).replace(tzinfo=None)
+        
+        start_dt = end_dt - timedelta(days=days-1)
+        start_date_str = start_dt.strftime('%Y-%m-%d')
+        end_date_str = end_dt.strftime('%Y-%m-%d')
+        
+        # 收集所有股票資料
+        comparison_data = {}
+        
+        for stock_code in stock_list:
+            contract = api.Contracts.Stocks.get(stock_code)
+            if not contract:
+                continue
+            
+            try:
+                # 取得K線資料
+                kbars = api.kbars(
+                    contract=contract,
+                    start=start_date_str,
+                    end=end_date_str,
+                    timeout=30000
+                )
+                
+                if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+                    continue
+                
+                # 轉換為DataFrame
+                df = pd.DataFrame({
+                    'ts': kbars.ts,
+                    'Open': kbars.Open,
+                    'High': kbars.High,
+                    'Low': kbars.Low,
+                    'Close': kbars.Close,
+                    'Volume': kbars.Volume
+                })
+                
+                df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                df['date'] = df['ts'].dt.date
+                
+                # 聚合為日K線
+                daily_df = df.groupby('date').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).reset_index()
+                
+                if len(daily_df) > 0:
+                    # 計算各項指標
+                    start_price = daily_df.iloc[0]['Open']
+                    end_price = daily_df.iloc[-1]['Close']
+                    total_return = ((end_price - start_price) / start_price * 100)
+                    
+                    # 計算每日收益率
+                    daily_df['daily_return'] = daily_df['Close'].pct_change() * 100
+                    
+                    # 計算波動率（標準差）
+                    volatility = daily_df['daily_return'].std()
+                    
+                    # 計算最大回撤
+                    cumulative_returns = (1 + daily_df['daily_return'] / 100).cumprod()
+                    running_max = cumulative_returns.expanding().max()
+                    drawdown = (cumulative_returns - running_max) / running_max * 100
+                    max_drawdown = drawdown.min()
+                    
+                    comparison_data[stock_code] = {
+                        "name": contract.name,
+                        "start_price": float(start_price),
+                        "end_price": float(end_price),
+                        "total_return": round(float(total_return), 2),
+                        "avg_daily_return": round(float(daily_df['daily_return'].mean()), 2),
+                        "volatility": round(float(volatility), 2),
+                        "max_drawdown": round(float(max_drawdown), 2),
+                        "highest": float(daily_df['High'].max()),
+                        "lowest": float(daily_df['Low'].min()),
+                        "avg_volume": int(daily_df['Volume'].mean()),
+                        "total_volume": int(daily_df['Volume'].sum()),
+                        "trading_days": len(daily_df)
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error processing {stock_code}: {e}")
+                continue
+        
+        if not comparison_data:
+            return {"success": False, "message": "No valid data for comparison"}
+        
+        # 排名
+        stocks_by_return = sorted(comparison_data.items(), key=lambda x: x[1]['total_return'], reverse=True)
+        stocks_by_volatility = sorted(comparison_data.items(), key=lambda x: x[1]['volatility'])
+        stocks_by_volume = sorted(comparison_data.items(), key=lambda x: x[1]['avg_volume'], reverse=True)
+        
+        # 準備排名結果
+        rankings = {
+            "by_return": [
+                {
+                    "rank": idx + 1,
+                    "code": code,
+                    "name": data['name'],
+                    "return": data['total_return']
+                }
+                for idx, (code, data) in enumerate(stocks_by_return)
+            ],
+            "by_volatility": [
+                {
+                    "rank": idx + 1,
+                    "code": code,
+                    "name": data['name'],
+                    "volatility": data['volatility']
+                }
+                for idx, (code, data) in enumerate(stocks_by_volatility)
+            ],
+            "by_volume": [
+                {
+                    "rank": idx + 1,
+                    "code": code,
+                    "name": data['name'],
+                    "avg_volume": data['avg_volume']
+                }
+                for idx, (code, data) in enumerate(stocks_by_volume)
+            ]
+        }
+        
+        logger.info(f"✅ 比較完成: {len(comparison_data)} 檔股票")
+        logger.info("="*60)
+        
+        return {
+            "success": True,
+            "period": {
+                "start": start_date_str,
+                "end": end_date_str,
+                "days": days
+            },
+            "comparison": comparison_data,
+            "rankings": rankings,
+            "best_performer": stocks_by_return[0][0] if stocks_by_return else None,
+            "most_stable": stocks_by_volatility[0][0] if stocks_by_volatility else None,
+            "highest_volume": stocks_by_volume[0][0] if stocks_by_volume else None,
+            "timestamp": datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            "timezone": "Asia/Taipei (+8)"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 錯誤發生: {e}")
+        return {"success": False, "message": f"Error: {str(e)}"}
+
+
 @app.post("/retry-login")
 async def retry_auto_login():
     """Retry auto-login using environment variables"""
