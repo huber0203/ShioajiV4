@@ -849,8 +849,207 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
         else:
-            # Daily data processing (existing logic)
-            return {"success": True, "message": "Daily data processing not implemented in this simplified version"}
+            # Daily data with specific date support and technical indicators
+            if target_date:
+                # For specific date, get data around that date
+                end_date = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=23, minute=59)))
+                start_date = end_date - timedelta(days=50)
+            else:
+                # For current date, use existing logic
+                now_tw = datetime.now(TW_TZ)
+                end_date = now_tw
+                start_date = end_date - timedelta(days=50)
+            
+            logger.info(f"Daily data - Start: {start_date}, End: {end_date}")
+            
+            try:
+                kbars = api.kbars(
+                    contract=contract
+                )
+                
+                logger.info(f"Daily raw kbars object type: {type(kbars)}")
+                
+                if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+                    return {"success": False, "message": f"No historical data available for {stock_code} around {base_date}"}
+                
+                try:
+                    df = pd.DataFrame({
+                        'ts': kbars.ts,
+                        'Open': kbars.Open,
+                        'High': kbars.High,
+                        'Low': kbars.Low,
+                        'Close': kbars.Close,
+                        'Volume': kbars.Volume
+                    })
+                    
+                    df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                    
+                    logger.info(f"Daily DataFrame shape: {df.shape}")
+                    logger.info(f"Daily DataFrame columns: {df.columns.tolist()}")
+                    
+                    if df.empty or len(df) < 5:
+                        return {
+                            "success": False, 
+                            "message": f"Insufficient historical data for {stock_code} around {base_date}. Got {len(df)} days, need at least 5."
+                        }
+                    
+                    # Extract price and volume data from DataFrame
+                    close_prices = [float(price) for price in df['Close'].tolist()]
+                    volumes = [int(volume) for volume in df['Volume'].tolist()]
+                    
+                    logger.info(f"Extracted close_prices length: {len(close_prices)}")
+                    logger.info(f"Close prices first 5: {close_prices[:5]}")
+                    logger.info(f"Close prices last 5: {close_prices[-5:]}")
+                    
+                    # 計算技術指標
+                    def calculate_ma(prices, period):
+                        if len(prices) < period:
+                            return None
+                        return sum(prices[-period:]) / period
+                    
+                    def calculate_bollinger_bands(prices, period=20, std_dev=2):
+                        if len(prices) < period:
+                            return None, None, None
+                        
+                        recent_prices = prices[-period:]
+                        ma = sum(recent_prices) / period
+                        variance = sum((price - ma) ** 2 for price in recent_prices) / period
+                        std = variance ** 0.5
+                        
+                        upper_band = ma + (std_dev * std)
+                        lower_band = ma - (std_dev * std)
+                        
+                        return ma, upper_band, lower_band
+                    
+                    # 🎯 計算你需要的技術指標
+                    ma_20 = calculate_ma(close_prices, min(20, len(close_prices)))
+                    ma_40 = calculate_ma(close_prices, min(40, len(close_prices))) if len(close_prices) >= 40 else None
+                    bb_ma, bb_upper, bb_lower = calculate_bollinger_bands(close_prices, min(20, len(close_prices)), 2)
+                    
+                    # 🎯 成交量分析
+                    current_volume = int(volumes[-1]) if volumes else 0
+                    avg_volume_5d = calculate_ma(volumes, min(5, len(volumes))) if len(volumes) >= 5 else None
+                    avg_volume_20d = calculate_ma(volumes, min(20, len(volumes))) if len(volumes) >= 20 else None
+                    
+                    # Get current price
+                    current_price = float(close_prices[-1]) if close_prices else None
+                    
+                    # Calculate trend signals
+                    trend_signal = None
+                    bb_signal = None
+                    
+                    if ma_20:
+                        if ma_40:
+                            if ma_20 > ma_40:
+                                trend_signal = "bullish" if current_price > ma_20 else "neutral"
+                            else:
+                                trend_signal = "bearish" if current_price < ma_20 else "neutral"
+                        else:
+                            # Use only MA20 for trend if MA40 is not available
+                            trend_signal = "bullish" if current_price > ma_20 else "bearish"
+                    
+                    if bb_upper and bb_lower and current_price:
+                        if current_price > bb_upper:
+                            bb_signal = "overbought"
+                        elif current_price < bb_lower:
+                            bb_signal = "oversold"
+                        else:
+                            bb_signal = "normal"
+                    
+                    # 嘗試獲取當日買賣量資料
+                    daily_buy_volume = None
+                    daily_sell_volume = None
+                    
+                    try:
+                        if target_date:
+                            tick_date = target_date
+                        else:
+                            tick_date = now_tw.date()
+                        
+                        ticks = api.ticks(
+                            contract=contract,
+                            date=tick_date.strftime('%Y-%m-%d')
+                        )
+                        
+                        if ticks and hasattr(ticks, 'ts') and ticks.ts:
+                            tick_data = {
+                                'ts': ticks.ts, 
+                                'close': ticks.close, 
+                                'volume': ticks.volume
+                            }
+                            
+                            if hasattr(ticks, 'tick_type') and ticks.tick_type:
+                                tick_data['tick_type'] = ticks.tick_type
+                            
+                            tick_df = pd.DataFrame(tick_data)
+                            tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                            
+                            logger.info(f"Daily tick data shape: {tick_df.shape}")
+                            
+                            if 'tick_type' in tick_df.columns:
+                                # Calculate daily buy/sell volume using tick_type
+                                buy_ticks = tick_df[tick_df['tick_type'] == 1]  # 外盤
+                                sell_ticks = tick_df[tick_df['tick_type'] == 2]  # 內盤
+                                neutral_ticks = tick_df[tick_df['tick_type'] == 0]  # 無法判定
+                                
+                                daily_buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
+                                daily_sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                                neutral_volume = int(neutral_ticks['volume'].sum()) if not neutral_ticks.empty else 0
+                                
+                                # Distribute neutral volume 50/50
+                                if neutral_volume > 0:
+                                    daily_buy_volume += neutral_volume // 2
+                                    daily_sell_volume += neutral_volume - (neutral_volume // 2)
+                                    
+                                logger.info(f"Daily buy/sell volume calculated: buy={daily_buy_volume}, sell={daily_sell_volume}")
+                        
+                    except Exception as tick_error:
+                        logger.error(f"Daily tick data error for {stock_code}: {tick_error}")
+                        daily_buy_volume = None
+                        daily_sell_volume = None
+                    
+                    # 🎯 返回完整的技術分析資料
+                    return {
+                        "success": True,
+                        "query_date": base_date.strftime('%Y-%m-%d'),
+                        "current_price": current_price,
+                        "technical_indicators": {
+                            "ma_20": round(ma_20, 2) if ma_20 else None,  # 🎯 20日均線
+                            "ma_40": round(ma_40, 2) if ma_40 else None,  # 🎯 40日均線
+                            "ma_40_available": ma_40 is not None,
+                            "bollinger_bands": {
+                                "middle": round(bb_ma, 2) if bb_ma else None,     # 布林中軌 (20MA)
+                                "upper": round(bb_upper, 2) if bb_upper else None, # 🎯 布林上軌
+                                "lower": round(bb_lower, 2) if bb_lower else None, # 🎯 布林下軌
+                                "signal": bb_signal
+                            }
+                        },
+                        "volume_analysis": {
+                            "current_volume": current_volume,                      # 🎯 當日成交量
+                            "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,  # 🎯 5日平均成交量
+                            "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None, # 20日平均成交量
+                            "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None,
+                            "daily_buy_volume": daily_buy_volume,
+                            "daily_sell_volume": daily_sell_volume,
+                            "buy_sell_ratio": round(daily_buy_volume / daily_sell_volume, 2) if daily_buy_volume and daily_sell_volume and daily_sell_volume > 0 else None
+                        },
+                        "signals": {
+                            "trend": trend_signal,
+                            "bollinger": bb_signal
+                        },
+                        "data_points": len(close_prices),
+                        "last_update": df.iloc[-1]['ts'].strftime('%Y-%m-%d %H:%M:%S') if not df.empty else None,
+                        "timezone": "Asia/Taipei (+8)"
+                    }
+                    
+                except Exception as df_error:
+                    logger.error(f"Error processing daily data for {stock_code}: {df_error}")
+                    return {"success": False, "message": f"Daily data processing error: {str(df_error)}"}
+        
+            except Exception as e:
+                logger.error(f"Error getting daily data for {stock_code}: {e}")
+                return {"success": False, "message": f"Daily data error: {str(e)}"}
+        
         
     except Exception as e:
         logger.error(f"Overall error for {stock_code}: {e}")
