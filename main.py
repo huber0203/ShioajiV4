@@ -830,56 +830,30 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
     logger.info(f"Contract info: {contract}")
     logger.info(f"Timeframe: {timeframe}, Session: {session}, Target date: {target_date}")
     
-    # Use target_date if provided, otherwise use current date
-    if target_date:
-        base_date = target_date
-        now_tw = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=12, minute=0)))
-    else:
-        now_tw = datetime.now(TW_TZ)
-        base_date = now_tw.date()
-    
-    if timeframe == "5min":
-        # Get intraday 1-minute data - use broader time range to capture available data
+    try:
+        # Use target_date if provided, otherwise use current date
+        if target_date:
+            base_date = target_date
+            now_tw = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=12, minute=0)))
+        else:
+            now_tw = datetime.now(TW_TZ)
+            base_date = now_tw.date()
         
-        try:
-            # First, get all available recent data
-            kbars = api.kbars(
-                contract=contract,
-                timeout=30000
-            )
-            
-            logger.info(f"Raw kbars object type: {type(kbars)}")
-            logger.info(f"Raw kbars attributes: {dir(kbars) if kbars else 'None'}")
-            
-            if kbars:
-                if hasattr(kbars, 'ts'):
-                    logger.info(f"Raw kbars.ts type: {type(kbars.ts)}")
-                    logger.info(f"Raw kbars.ts length: {len(kbars.ts) if kbars.ts else 0}")
-                    logger.info(f"Raw kbars.ts first 5 values: {kbars.ts[:5] if kbars.ts else 'None'}")
-                
-                if hasattr(kbars, 'Open'):
-                    logger.info(f"Raw kbars.Open type: {type(kbars.Open)}")
-                    logger.info(f"Raw kbars.Open length: {len(kbars.Open) if kbars.Open else 0}")
-                    logger.info(f"Raw kbars.Open first 5 values: {kbars.Open[:5] if kbars.Open else 'None'}")
-                
-                if hasattr(kbars, 'High'):
-                    logger.info(f"Raw kbars.High first 5 values: {kbars.High[:5] if kbars.High else 'None'}")
-                
-                if hasattr(kbars, 'Low'):
-                    logger.info(f"Raw kbars.Low first 5 values: {kbars.Low[:5] if kbars.Low else 'None'}")
-                
-                if hasattr(kbars, 'Close'):
-                    logger.info(f"Raw kbars.Close first 5 values: {kbars.Close[:5] if kbars.Close else 'None'}")
-                
-                if hasattr(kbars, 'Volume'):
-                    logger.info(f"Raw kbars.Volume type: {type(kbars.Volume)}")
-                    logger.info(f"Raw kbars.Volume first 5 values: {kbars.Volume[:5] if kbars.Volume else 'None'}")
-            
-            if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                logger.info(f"No kbars data available - kbars: {kbars}, has ts: {hasattr(kbars, 'ts') if kbars else False}")
-                return {"success": False, "message": f"No intraday data available for {stock_code}"}
-            
+        if timeframe == "5min":
+            # Get intraday 1-minute data
             try:
+                # Get all available recent data
+                kbars = api.kbars(
+                    contract=contract,
+                    timeout=30000
+                )
+                
+                logger.info(f"Raw kbars object type: {type(kbars)}")
+                
+                if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+                    logger.info(f"No kbars data available")
+                    return {"success": False, "message": f"No intraday data available for {stock_code}"}
+                
                 # Convert kbars to DataFrame properly
                 df = pd.DataFrame({
                     'ts': kbars.ts,
@@ -891,42 +865,70 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 })
                 
                 logger.info(f"DataFrame shape after conversion: {df.shape}")
-                logger.info(f"DataFrame columns: {df.columns.tolist()}")
-                logger.info(f"DataFrame dtypes: {df.dtypes.to_dict()}")
-                logger.info(f"DataFrame first 3 rows:\n{df.head(3)}")
                 
-                # Convert timestamps to Taiwan timezone
+                # 🔧 關鍵修復：正確的時間戳轉換和智能時間過濾
                 df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert(TW_TZ)
                 
-                logger.info(f"After timezone conversion - first 3 timestamps: {df['ts'].head(3).tolist()}")
-                logger.info(f"After timezone conversion - last 3 timestamps: {df['ts'].tail(3).tolist()}")
+                # 分析可用時間範圍
+                min_hour = df['ts'].dt.hour.min()
+                max_hour = df['ts'].dt.hour.max()
+                unique_hours = sorted(df['ts'].dt.hour.unique())
                 
+                logger.info(f"📊 Available time range: {min_hour}:00 - {max_hour}:00")
+                logger.info(f"📊 Available hours: {unique_hours}")
+                logger.info(f"📊 Total data points: {len(df)}")
+                
+                # 🎯 智能時間過濾策略
                 if session == "morning":
-                    # Morning session (早盤): 09:00 - 13:30 Taiwan time
                     session_name = "早盤 (Morning Session)"
-                    # Filter for morning hours (9-13)
-                    df_session = df[df['ts'].dt.hour.between(9, 13)]
-                    # Also include 13:30 data
-                    df_1330 = df[(df['ts'].dt.hour == 13) & (df['ts'].dt.minute <= 30)]
-                    df_session = pd.concat([df_session, df_1330]).drop_duplicates().sort_values('ts')
                     
+                    # 標準早盤時間：09:00-13:30
+                    morning_hours = list(range(9, 14))  # 9, 10, 11, 12, 13
+                    has_morning_data = any(h in unique_hours for h in morning_hours)
+                    
+                    if has_morning_data:
+                        # 🎯 方案1：有標準早盤資料
+                        df_session = df[
+                            (df['ts'].dt.hour.between(9, 13)) |
+                            ((df['ts'].dt.hour == 13) & (df['ts'].dt.minute <= 30))
+                        ]
+                        time_strategy = "strict_morning"
+                        logger.info(f"✅ Using strict morning hours (9:00-13:30): {len(df_session)} bars")
+                        
+                    else:
+                        # 🎯 方案2：沒有標準早盤，找白天時間
+                        day_hours = list(range(6, 19))  # 6:00-18:00
+                        has_day_data = any(h in unique_hours for h in day_hours)
+                        
+                        if has_day_data:
+                            df_session = df[df['ts'].dt.hour.between(6, 18)]
+                            time_strategy = "extended_day"
+                            logger.info(f"⚠️  No standard morning data, using day hours (6:00-18:00): {len(df_session)} bars")
+                            
+                        else:
+                            # 🎯 方案3：使用所有可用資料
+                            df_session = df.copy()
+                            time_strategy = "all_available"
+                            logger.info(f"⚠️  Using all available data: {len(df_session)} bars")
+                            
                 elif session == "night":
-                    # Night session (夜盤): 15:00 - 05:00 next day Taiwan time
                     session_name = "夜盤 (Night Session)"
-                    # Filter for night hours (15-23 and 0-5)
+                    # 夜盤：15:00-05:00 next day
                     df_night1 = df[df['ts'].dt.hour >= 15]  # 15:00-23:59
                     df_night2 = df[df['ts'].dt.hour <= 5]   # 00:00-05:00
                     df_session = pd.concat([df_night1, df_night2]).drop_duplicates().sort_values('ts')
+                    time_strategy = "night_session"
+                    logger.info(f"✅ Using night session (15:00-05:00): {len(df_session)} bars")
                 
                 logger.info(f"After session filtering ({session}) - DataFrame shape: {df_session.shape}")
+                logger.info(f"Time strategy used: {time_strategy}")
                 
                 if df_session.empty:
-                    available_start = df['ts'].min().strftime('%H:%M') if not df.empty else "N/A"
-                    available_end = df['ts'].max().strftime('%H:%M') if not df.empty else "N/A"
                     return {
                         "success": False, 
-                        "message": f"No {session} session data available for {stock_code}. Available data time range: {available_start} - {available_end}",
-                        "available_data_range": f"{available_start} - {available_end}",
+                        "message": f"No data available for {stock_code} {session} session",
+                        "available_hours": unique_hours,
+                        "available_time_range": f"{min_hour}:00 - {max_hour}:00",
                         "requested_session": session_name
                     }
                 
@@ -943,7 +945,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 }).dropna()
                 
                 logger.info(f"After 5-minute resampling - DataFrame shape: {df_5min.shape}")
-                logger.info(f"5-minute bars first 3 rows:\n{df_5min.head(3)}")
                 
                 # Reset index to get timestamp back as column
                 df_5min.reset_index(inplace=True)
@@ -951,74 +952,21 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 if df_5min.empty:
                     return {"success": False, "message": f"Could not create 5-minute bars for {stock_code} {session} session"}
                 
+                # 🎯 獲取 tick 資料來計算買賣張數
+                tick_df = None
                 try:
-                    if session == "night" and start_time.date() != end_time.date():
-                        # For night session spanning two days, get ticks for both days
-                        ticks_day1 = api.ticks(
-                            contract=contract,
-                            date=start_time.strftime('%Y-%m-%d'),
-                            timeout=30000
-                        )
-                        ticks_day2 = api.ticks(
-                            contract=contract,
-                            date=end_time.strftime('%Y-%m-%d'),
-                            timeout=30000
-                        )
-                        
-                        logger.info(f"Ticks day 1 type: {type(ticks_day1)}")
-                        logger.info(f"Ticks day 1 attributes: {dir(ticks_day1) if ticks_day1 else 'None'}")
-                        logger.info(f"Ticks day 2 type: {type(ticks_day2)}")
-                        logger.info(f"Ticks day 2 attributes: {dir(ticks_day2) if ticks_day2 else 'None'}")
-                        
-                        # Combine tick data from both days
-                        if ticks_day1 and ticks_day2:
-                            combined_ticks = {
-                                'ts': list(ticks_day1.ts) + list(ticks_day2.ts),
-                                'close': list(ticks_day1.close) + list(ticks_day2.close),
-                                'volume': list(ticks_day1.volume) + list(ticks_day2.volume)
-                            }
-                            if hasattr(ticks_day1, 'tick_type') and hasattr(ticks_day2, 'tick_type'):
-                                combined_ticks['tick_type'] = list(ticks_day1.tick_type) + list(ticks_day2.tick_type)
-                            ticks = type('CombinedTicks', (), combined_ticks)()
-                        else:
-                            ticks = ticks_day1 or ticks_day2
-                    else:
-                        # For morning session or single-day night session
-                        ticks = api.ticks(
-                            contract=contract,
-                            date=start_time.strftime('%Y-%m-%d'),
-                            timeout=30000
-                        )
+                    # 嘗試獲取查詢日期的 tick 資料
+                    logger.info(f"Trying to get tick data for date: {base_date}")
+                    
+                    ticks = api.ticks(
+                        contract=contract,
+                        date=base_date.strftime('%Y-%m-%d'),
+                        timeout=30000
+                    )
                     
                     logger.info(f"Raw ticks object type: {type(ticks)}")
-                    logger.info(f"Raw ticks attributes: {dir(ticks) if ticks else 'None'}")
                     
-                    if ticks:
-                        if hasattr(ticks, 'ts'):
-                            logger.info(f"Raw ticks.ts type: {type(ticks.ts)}")
-                            logger.info(f"Raw ticks.ts length: {len(ticks.ts) if ticks.ts else 0}")
-                            logger.info(f"Raw ticks.ts first 3 values: {ticks.ts[:3] if ticks.ts else 'None'}")
-                        
-                        if hasattr(ticks, 'close'):
-                            logger.info(f"Raw ticks.close type: {type(ticks.close)}")
-                            logger.info(f"Raw ticks.close first 3 values: {ticks.close[:3] if ticks.close else 'None'}")
-                        
-                        if hasattr(ticks, 'volume'):
-                            logger.info(f"Raw ticks.volume type: {type(ticks.volume)}")
-                            logger.info(f"Raw ticks.volume first 3 values: {ticks.volume[:3] if ticks.volume else 'None'}")
-                        
-                        if hasattr(ticks, 'tick_type'):
-                            logger.info(f"Raw ticks.tick_type type: {type(ticks.tick_type)}")
-                            logger.info(f"Raw ticks.tick_type first 3 values: {ticks.tick_type[:3] if ticks.tick_type else 'None'}")
-                        
-                        if hasattr(ticks, 'bid_price'):
-                            logger.info(f"Raw ticks.bid_price exists: {hasattr(ticks, 'bid_price')}")
-                        
-                        if hasattr(ticks, 'ask_price'):
-                            logger.info(f"Raw ticks.ask_price exists: {hasattr(ticks, 'ask_price')}")
-                    
-                    # Process tick data to calculate buy/sell volume for each 5-minute interval
-                    tick_df = None
+                    # Process tick data
                     if ticks and hasattr(ticks, 'ts') and ticks.ts:
                         tick_data = {
                             'ts': ticks.ts, 
@@ -1032,23 +980,28 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         tick_df = pd.DataFrame(tick_data)
                         tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
                         
-                        tick_df = tick_df[(tick_df['ts'] >= start_time) & (tick_df['ts'] <= end_time)]
+                        # Filter tick data to match session time range
+                        session_start = df_session.index.min()
+                        session_end = df_session.index.max()
+                        tick_df = tick_df[(tick_df['ts'] >= session_start) & (tick_df['ts'] <= session_end)]
                         
-                        logger.info(f"Tick DataFrame shape: {tick_df.shape}")
-                        logger.info(f"Tick DataFrame columns: {tick_df.columns.tolist()}")
-                        logger.info(f"Tick DataFrame first 3 rows:\n{tick_df.head(3)}")
-                        
-                        logger.info(f"Processed {len(tick_df)} ticks for {stock_code} {session} session")
+                        logger.info(f"✅ Tick DataFrame shape: {tick_df.shape}")
+                        logger.info(f"Tick data time range: {tick_df['ts'].min()} to {tick_df['ts'].max()}")
                         
                 except Exception as tick_error:
-                    logger.error(f"Tick data error for {stock_code} {session} session: {tick_error}")
+                    logger.error(f"Tick data error for {stock_code}: {tick_error}")
                     tick_df = None
                 
+                # 📊 處理每個 5 分鐘區間的買賣張數
                 intraday_data = []
                 total_volume_session = 0
+                total_buy_volume = 0
+                total_sell_volume = 0
                 
-                for _, row in df_5min.iterrows():
-                    # Calculate average price (OHLC average)
+                logger.info(f"🔄 Processing {len(df_5min)} five-minute intervals...")
+                
+                for idx, row in df_5min.iterrows():
+                    # Calculate basic OHLC data
                     open_price = float(row['Open'])
                     high_price = float(row['High'])
                     low_price = float(row['Low'])
@@ -1060,6 +1013,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     buy_volume = None
                     sell_volume = None
                     
+                    # 🎯 計算買賣張數
                     if tick_df is not None and not tick_df.empty:
                         # Find ticks within this 5-minute interval
                         interval_start = row['ts'] - pd.Timedelta(minutes=5)
@@ -1072,22 +1026,24 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         
                         if not interval_ticks.empty:
                             if 'tick_type' in interval_ticks.columns:
-                                buy_ticks = interval_ticks[interval_ticks['tick_type'] == 1]
-                                sell_ticks = interval_ticks[interval_ticks['tick_type'] == 2]
-                                neutral_ticks = interval_ticks[interval_ticks['tick_type'] == 0]
+                                # 🎯 使用 tick_type 精確計算（最準確的方法）
+                                buy_ticks = interval_ticks[interval_ticks['tick_type'] == 1]  # 外盤（買方）
+                                sell_ticks = interval_ticks[interval_ticks['tick_type'] == 2]  # 內盤（賣方）
+                                neutral_ticks = interval_ticks[interval_ticks['tick_type'] == 0]  # 無法判定
                                 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
                                 neutral_volume = int(neutral_ticks['volume'].sum()) if not neutral_ticks.empty else 0
                                 
-                                logger.info(f"5min interval {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume}, neutral={neutral_volume}, total_ticks={len(interval_ticks)}")
-                                
-                                # Distribute neutral volume 50/50 instead of proportionally
+                                # 中性交易平均分配
                                 if neutral_volume > 0:
                                     buy_volume += neutral_volume // 2
                                     sell_volume += neutral_volume - (neutral_volume // 2)
                                 
+                                logger.info(f"🎯 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張, 中性{neutral_volume}張 (共{len(interval_ticks)}筆tick)")
+                                
                             else:
+                                # 🎯 使用價格判斷方法（次選）
                                 interval_avg = (open_price + high_price + low_price + close_price) / 4
                                 buy_ticks = interval_ticks[interval_ticks['close'] >= interval_avg]
                                 sell_ticks = interval_ticks[interval_ticks['close'] < interval_avg]
@@ -1095,35 +1051,45 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
                                 
-                                logger.info(f"5min interval {row['ts'].strftime('%H:%M')} (fallback): buy={buy_volume}, sell={sell_volume}")
+                                logger.info(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (價格判斷法)")
                             
+                            # 🔧 確保 tick 總量不超過 K 線量
                             total_tick_volume = buy_volume + sell_volume
                             if total_tick_volume > volume and volume > 0:
-                                # Proportionally adjust if tick volume exceeds K-bar volume
                                 ratio = volume / total_tick_volume
                                 buy_volume = int(buy_volume * ratio)
                                 sell_volume = int(sell_volume * ratio)
-                                logger.info(f"Adjusted volumes for {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume} (ratio={ratio:.2f})")
-                            elif total_tick_volume == 0 and volume > 0:
-                                # If no tick data, estimate 50/50
-                                buy_volume = volume // 2
-                                sell_volume = volume - buy_volume
-                                logger.info(f"Estimated 50/50 for {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume}")
+                                logger.info(f"🔧 調整: {row['ts'].strftime('%H:%M')} 買{buy_volume}張, 賣{sell_volume}張 (比例={ratio:.2f})")
+                                
+                    # 🎯 回退方案：沒有 tick 資料時的估算
+                    if (buy_volume is None or sell_volume is None) and volume > 0:
+                        buy_volume = volume // 2
+                        sell_volume = volume - buy_volume
+                        logger.info(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (50/50估算)")
 
+                    # 🎯 構建5分鐘K線資料（包含買賣張數）
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
+                        "datetime": row['ts'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "date": row['ts'].strftime('%Y-%m-%d'),
                         "open": open_price,
                         "high": high_price,
                         "low": low_price,
                         "close": close_price,
                         "average_price": round(avg_price, 2),
-                        "volume": volume,
-                        "buy_volume": buy_volume,
-                        "sell_volume": sell_volume
+                        "volume": volume,           # 總成交張數
+                        "buy_volume": buy_volume,   # 🎯 買方張數
+                        "sell_volume": sell_volume, # 🎯 賣方張數
+                        "buy_sell_ratio": round(buy_volume / sell_volume, 2) if buy_volume and sell_volume and sell_volume > 0 else None,
+                        "net_flow": buy_volume - sell_volume if buy_volume is not None and sell_volume is not None else None  # 淨流入
                     }
                     
                     intraday_data.append(bar_data)
                     total_volume_session += volume
+                    if buy_volume is not None:
+                        total_buy_volume += buy_volume
+                    if sell_volume is not None:
+                        total_sell_volume += sell_volume
 
                 if not intraday_data:
                     return {"success": False, "message": f"Could not process 5-minute data for {stock_code} {session} session"}
@@ -1131,79 +1097,72 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                 # Sort by time to ensure proper order
                 intraday_data.sort(key=lambda x: x["time"])
                 
-                current_hour = now_tw.hour
-                current_minute = now_tw.minute
-                
-                if session == "morning":
-                    market_status = "open" if 9 <= current_hour < 13 or (current_hour == 13 and current_minute <= 30) else "closed"
-                else:  # night session
-                    market_status = "open" if (current_hour >= 15) or (current_hour < 5) else "closed"
-                
+                # 🎯 返回完整的5分鐘買賣張數資料
                 return {
                     "success": True,
                     "session": session_name,
+                    "time_strategy": time_strategy,
                     "query_date": base_date.strftime('%Y-%m-%d'),
-                    "session_time_range": f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}",
-                    "current_time": now_tw.strftime('%H:%M'),
-                    "current_date": now_tw.strftime('%Y-%m-%d'),
-                    "session_total_volume": total_volume_session,
-                    "intraday_bars": intraday_data,  # All 5-minute bars for the specified session
-                    "total_bars_session": len(intraday_data),
-                    "market_status": market_status,
+                    "available_hours": unique_hours,
+                    "data_time_range": f"{df_session.index.min().strftime('%H:%M')} - {df_session.index.max().strftime('%H:%M')}",
+                    "session_summary": {
+                        "total_volume": total_volume_session,
+                        "total_buy_volume": total_buy_volume,
+                        "total_sell_volume": total_sell_volume,
+                        "net_flow": total_buy_volume - total_sell_volume if total_buy_volume and total_sell_volume else None,
+                        "buy_sell_ratio": round(total_buy_volume / total_sell_volume, 2) if total_buy_volume and total_sell_volume and total_sell_volume > 0 else None
+                    },
+                    "intraday_bars": intraday_data,  # 🎯 每5分鐘的詳細買賣張數！
+                    "total_bars": len(intraday_data),
+                    "buy_sell_data_available": tick_df is not None and not tick_df.empty,
+                    "tick_data_points": len(tick_df) if tick_df is not None else 0,
                     "timezone": "Asia/Taipei (+8)",
-                    "data_range": f"{intraday_data[0]['time']} - {intraday_data[-1]['time']}" if intraday_data else "No data",
-                    "buy_sell_data_available": tick_df is not None,
-                    "aggregation_method": "1min -> 5min resampling"
+                    "aggregation_method": "1min -> 5min resampling with tick-based buy/sell calculation"
                 }
                 
             except Exception as df_error:
-                logger.error(f"Error processing 5-minute data for {stock_code} {session} session on {base_date}: {df_error}")
+                logger.error(f"Error processing 5-minute data for {stock_code}: {df_error}")
                 return {"success": False, "message": f"Data processing error: {str(df_error)}"}
             
-        except Exception as e:
-            logger.error(f"Error getting 5min data for {stock_code} {session} session on {base_date}: {e}")
-            return {"success": False, "message": f"5min data error: {str(e)}"}
-        
-    else:
-        # Daily data with specific date support
-        if target_date:
-            # For specific date, get data around that date
-            end_date = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=23, minute=59)))
-            start_date = end_date - timedelta(days=50)
         else:
-            # For current date, use existing logic
-            now_tw = datetime.now(TW_TZ)
-            end_date = now_tw
-            start_date = end_date - timedelta(days=50)
-        
-        logger.info(f"Daily data - Start: {start_date}, End: {end_date}")
-        
-        try:
-            kbars = api.kbars(
-                contract=contract
-            )
+            # Daily data with specific date support
+            if target_date:
+                # For specific date, get data around that date
+                end_date = TW_TZ.localize(datetime.combine(target_date, datetime.min.time().replace(hour=23, minute=59)))
+                start_date = end_date - timedelta(days=50)
+            else:
+                # For current date, use existing logic
+                now_tw = datetime.now(TW_TZ)
+                end_date = now_tw
+                start_date = end_date - timedelta(days=50)
             
-            logger.info(f"Daily raw kbars object type: {type(kbars)}")
-            logger.info(f"Daily raw kbars attributes: {dir(kbars) if kbars else 'None'}")
-            
-            if kbars:
-                if hasattr(kbars, 'ts'):
-                    logger.info(f"Daily kbars.ts length: {len(kbars.ts) if kbars.ts else 0}")
-                    logger.info(f"Daily kbars.ts first 3: {kbars.ts[:3] if kbars.ts else 'None'}")
-                    logger.info(f"Daily kbars.ts last 3: {kbars.ts[-3:] if kbars.ts else 'None'}")
-                
-                if hasattr(kbars, 'Close'):
-                    logger.info(f"Daily kbars.Close first 3: {kbars.Close[:3] if kbars.Close else 'None'}")
-                    logger.info(f"Daily kbars.Close last 3: {kbars.Close[-3:] if kbars.Close else 'None'}")
-                
-                if hasattr(kbars, 'Volume'):
-                    logger.info(f"Daily kbars.Volume first 3: {kbars.Volume[:3] if kbars.Volume else 'None'}")
-                    logger.info(f"Daily kbars.Volume last 3: {kbars.Volume[-3:] if kbars.Volume else 'None'}")
-            
-            if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
-                return {"success": False, "message": f"No historical data available for {stock_code} around {base_date}"}
+            logger.info(f"Daily data - Start: {start_date}, End: {end_date}")
             
             try:
+                kbars = api.kbars(
+                    contract=contract
+                )
+                
+                logger.info(f"Daily raw kbars object type: {type(kbars)}")
+                logger.info(f"Daily raw kbars attributes: {dir(kbars) if kbars else 'None'}")
+                
+                if kbars:
+                    if hasattr(kbars, 'ts'):
+                        logger.info(f"Daily kbars.ts length: {len(kbars.ts) if kbars.ts else 0}")
+                        logger.info(f"Daily kbars.ts first 3: {kbars.ts[:3] if kbars.ts else 'None'}")
+                        logger.info(f"Daily kbars.ts last 3: {kbars.ts[-3:] if kbars.ts else 'None'}")
+                    
+                    if hasattr(kbars, 'Close'):
+                        logger.info(f"Daily kbars.Close first 3: {kbars.Close[:3] if kbars.Close else 'None'}")
+                        logger.info(f"Daily kbars.Close last 3: {kbars.Close[-3:] if kbars.Close else 'None'}")
+                    
+                    if hasattr(kbars, 'Volume'):
+                        logger.info(f"Daily kbars.Volume first 3: {kbars.Volume[:3] if kbars.Volume else 'None'}")
+                        logger.info(f"Daily kbars.Volume last 3: {kbars.Volume[-3:] if kbars.Volume else 'None'}")
+                
+                if not kbars or not hasattr(kbars, 'ts') or not kbars.ts:
+                    return {"success": False, "message": f"No historical data available for {stock_code} around {base_date}"}
+                
                 df = pd.DataFrame({**kbars})
                 df.ts = pd.to_datetime(df.ts, utc=True).dt.tz_convert(TW_TZ)
                 
@@ -1391,8 +1350,12 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
             logger.error(f"Error getting daily data for {stock_code}: {e}")
             return {"success": False, "message": f"Daily data error: {str(e)}"}
         
-        finally:
-            logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
+    except Exception as e:
+        logger.error(f"Overall error for {stock_code}: {e}")
+        return {"success": False, "message": f"Technical analysis error: {str(e)}"}
+    
+    finally:
+        logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
 
 @app.get("/health")
 async def health_check():
