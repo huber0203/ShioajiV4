@@ -650,7 +650,7 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     return {
                         "success": False, 
                         "message": f"No data available for {stock_code} {session} session",
-                        "available_hours": unique_hours,
+                        "available_hours": [int(h) for h in unique_hours],  # Convert numpy int to Python int
                         "available_time_range": f"{min_hour}:00 - {max_hour}:00",
                         "requested_session": session_name
                     }
@@ -791,28 +791,29 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         logger.info(f"📊 {row['ts'].strftime('%H:%M')}: 買{buy_volume}張, 賣{sell_volume}張 (50/50估算)")
 
                     # Build 5-minute K-bar data (including buy/sell volumes)
+                    # Convert all numpy types to Python native types for JSON serialization
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
                         "datetime": row['ts'].strftime('%Y-%m-%d %H:%M:%S'),
                         "date": row['ts'].strftime('%Y-%m-%d'),
-                        "open": open_price,
-                        "high": high_price,
-                        "low": low_price,
-                        "close": close_price,
-                        "average_price": round(avg_price, 2),
-                        "volume": volume,           # Total volume
-                        "buy_volume": buy_volume,   # Buy volume
-                        "sell_volume": sell_volume, # Sell volume
-                        "buy_sell_ratio": round(buy_volume / sell_volume, 2) if buy_volume and sell_volume and sell_volume > 0 else None,
-                        "net_flow": buy_volume - sell_volume if buy_volume is not None and sell_volume is not None else None  # Net flow
+                        "open": float(open_price),
+                        "high": float(high_price),
+                        "low": float(low_price),
+                        "close": float(close_price),
+                        "average_price": round(float(avg_price), 2),
+                        "volume": int(volume),           # Total volume
+                        "buy_volume": int(buy_volume) if buy_volume is not None else None,   # Buy volume
+                        "sell_volume": int(sell_volume) if sell_volume is not None else None, # Sell volume
+                        "buy_sell_ratio": round(float(buy_volume) / float(sell_volume), 2) if buy_volume and sell_volume and sell_volume > 0 else None,
+                        "net_flow": int(buy_volume) - int(sell_volume) if buy_volume is not None and sell_volume is not None else None  # Net flow
                     }
                     
                     intraday_data.append(bar_data)
-                    total_volume_session += volume
+                    total_volume_session += int(volume)
                     if buy_volume is not None:
-                        total_buy_volume += buy_volume
+                        total_buy_volume += int(buy_volume)
                     if sell_volume is not None:
-                        total_sell_volume += sell_volume
+                        total_sell_volume += int(sell_volume)
 
                 if not intraday_data:
                     return {"success": False, "message": f"Could not process 5-minute data for {stock_code} {session} session"}
@@ -826,14 +827,14 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     "session": session_name,
                     "time_strategy": time_strategy,
                     "query_date": base_date.strftime('%Y-%m-%d'),
-                    "available_hours": unique_hours,
+                    "available_hours": [int(h) for h in unique_hours],  # Convert numpy int to Python int
                     "data_time_range": f"{df_session.index.min().strftime('%H:%M')} - {df_session.index.max().strftime('%H:%M')}",
                     "session_summary": {
-                        "total_volume": total_volume_session,
-                        "total_buy_volume": total_buy_volume,
-                        "total_sell_volume": total_sell_volume,
-                        "net_flow": total_buy_volume - total_sell_volume if total_buy_volume and total_sell_volume else None,
-                        "buy_sell_ratio": round(total_buy_volume / total_sell_volume, 2) if total_buy_volume and total_sell_volume and total_sell_volume > 0 else None
+                        "total_volume": int(total_volume_session),
+                        "total_buy_volume": int(total_buy_volume),
+                        "total_sell_volume": int(total_sell_volume),
+                        "net_flow": int(total_buy_volume) - int(total_sell_volume) if total_buy_volume and total_sell_volume else None,
+                        "buy_sell_ratio": round(float(total_buy_volume) / float(total_sell_volume), 2) if total_buy_volume and total_sell_volume and total_sell_volume > 0 else None
                     },
                     "intraday_bars": intraday_data,  # Detailed 5-minute buy/sell volumes!
                     "total_bars": len(intraday_data),
