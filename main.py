@@ -40,7 +40,7 @@ class OrderRequest(BaseModel):
 class LoginResponse(BaseModel):
     success: bool
     message: str
-    account_info: Optional[Dict, Any] = None
+    account_info: Optional[Dict[str, Any]] = None
 
 class OrderResponse(BaseModel):
     success: bool
