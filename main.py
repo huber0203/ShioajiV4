@@ -460,6 +460,282 @@ async def get_quote(stock_code: str):
         logger.error(f"Get quote error: {e}")
         return {"success": False, "message": f"Error: {str(e)}"}
 
+@app.get("/realtime/{stock_code}")
+async def get_realtime_quote(stock_code: str):
+    """Get comprehensive real-time quote data with full parameter logging
+    
+    Returns all available Shioaji quote parameters with Chinese descriptions
+    """
+    global api
+    try:
+        if not ensure_login():
+            return {"success": False, "message": "Unable to connect - please check environment variables"}
+        
+        # Get contract
+        contract = api.Contracts.Stocks.get(stock_code)
+        if not contract:
+            return {"success": False, "message": f"Stock {stock_code} not found"}
+        
+        logger.info(f"=== 即時行情查詢開始 ===")
+        logger.info(f"股票代碼: {stock_code}")
+        logger.info(f"股票名稱: {contract.name}")
+        
+        # Try to get comprehensive quote data
+        quote_data = None
+        data_source = "unknown"
+        
+        try:
+            # Method 1: Try snapshots (most comprehensive)
+            snapshots = api.snapshots([contract])
+            if snapshots and len(snapshots) > 0:
+                quote_data = snapshots[0]
+                data_source = "snapshots"
+                logger.info("數據來源: snapshots API")
+        except Exception as e:
+            logger.warning(f"Snapshots failed: {e}")
+        
+        if not quote_data:
+            try:
+                # Method 2: Try quote subscription (if available)
+                # Note: This would require setting up callbacks, so we'll skip for now
+                pass
+            except Exception as e:
+                logger.warning(f"Quote subscription failed: {e}")
+        
+        if not quote_data:
+            return {
+                "success": False, 
+                "message": f"Unable to get real-time data for {stock_code}",
+                "contract_info": {
+                    "code": stock_code,
+                    "name": contract.name,
+                    "exchange": str(contract.exchange) if hasattr(contract, 'exchange') else "unknown"
+                }
+            }
+        
+        # Log all raw attributes
+        logger.info("=== 原始數據結構 ===")
+        logger.info(f"數據類型: {type(quote_data)}")
+        logger.info(f"所有屬性: {dir(quote_data)}")
+        
+        # Extract and log all available parameters with Chinese descriptions
+        quote_params = {}
+        
+        # 基本資訊 (Basic Information)
+        if hasattr(quote_data, 'code'):
+            quote_params['code'] = str(quote_data.code)
+            logger.info(f"商品代碼 (code): {quote_data.code}")
+        
+        if hasattr(quote_data, 'datetime'):
+            quote_params['datetime'] = quote_data.datetime.strftime('%Y-%m-%d %H:%M:%S') if quote_data.datetime else None
+            logger.info(f"時間 (datetime): {quote_data.datetime}")
+        
+        # 價格資訊 (Price Information)
+        if hasattr(quote_data, 'open'):
+            quote_params['open'] = float(quote_data.open) if quote_data.open else 0
+            logger.info(f"開盤價 (open): {quote_data.open}")
+        
+        if hasattr(quote_data, 'close'):
+            quote_params['close'] = float(quote_data.close) if quote_data.close else 0
+            logger.info(f"成交價 (close): {quote_data.close}")
+        
+        if hasattr(quote_data, 'high'):
+            quote_params['high'] = float(quote_data.high) if quote_data.high else 0
+            logger.info(f"最高價 (high): {quote_data.high}")
+        
+        if hasattr(quote_data, 'low'):
+            quote_params['low'] = float(quote_data.low) if quote_data.low else 0
+            logger.info(f"最低價 (low): {quote_data.low}")
+        
+        if hasattr(quote_data, 'avg_price'):
+            quote_params['avg_price'] = float(quote_data.avg_price) if quote_data.avg_price else 0
+            logger.info(f"均價 (avg_price): {quote_data.avg_price}")
+        
+        # 成交量資訊 (Volume Information)
+        if hasattr(quote_data, 'volume'):
+            quote_params['volume'] = int(quote_data.volume) if quote_data.volume else 0
+            logger.info(f"成交量 (volume): {quote_data.volume}")
+        
+        if hasattr(quote_data, 'total_volume'):
+            quote_params['total_volume'] = int(quote_data.total_volume) if quote_data.total_volume else 0
+            logger.info(f"總成交量 (total_volume): {quote_data.total_volume}")
+        
+        # 成交額資訊 (Amount Information)
+        if hasattr(quote_data, 'amount'):
+            quote_params['amount'] = float(quote_data.amount) if quote_data.amount else 0
+            logger.info(f"成交額 (amount): {quote_data.amount}")
+        
+        if hasattr(quote_data, 'total_amount'):
+            quote_params['total_amount'] = float(quote_data.total_amount) if quote_data.total_amount else 0
+            logger.info(f"總成交額 (total_amount): {quote_data.total_amount}")
+        
+        # 內外盤資訊 (Buy/Sell Side Information)
+        if hasattr(quote_data, 'tick_type'):
+            quote_params['tick_type'] = int(quote_data.tick_type) if quote_data.tick_type is not None else 0
+            tick_type_desc = {1: "外盤", 2: "內盤", 0: "無法判定"}.get(quote_params['tick_type'], "未知")
+            logger.info(f"內外盤別 (tick_type): {quote_data.tick_type} ({tick_type_desc})")
+        
+        if hasattr(quote_data, 'bid_side_total_vol'):
+            quote_params['bid_side_total_vol'] = int(quote_data.bid_side_total_vol) if quote_data.bid_side_total_vol else 0
+            logger.info(f"買盤成交總量 (bid_side_total_vol): {quote_data.bid_side_total_vol}")
+        
+        if hasattr(quote_data, 'ask_side_total_vol'):
+            quote_params['ask_side_total_vol'] = int(quote_data.ask_side_total_vol) if quote_data.ask_side_total_vol else 0
+            logger.info(f"賣盤成交總量 (ask_side_total_vol): {quote_data.ask_side_total_vol}")
+        
+        if hasattr(quote_data, 'bid_side_total_cnt'):
+            quote_params['bid_side_total_cnt'] = int(quote_data.bid_side_total_cnt) if quote_data.bid_side_total_cnt else 0
+            logger.info(f"買盤成交筆數 (bid_side_total_cnt): {quote_data.bid_side_total_cnt}")
+        
+        if hasattr(quote_data, 'ask_side_total_cnt'):
+            quote_params['ask_side_total_cnt'] = int(quote_data.ask_side_total_cnt) if quote_data.ask_side_total_cnt else 0
+            logger.info(f"賣盤成交筆數 (ask_side_total_cnt): {quote_data.ask_side_total_cnt}")
+        
+        # 漲跌資訊 (Change Information)
+        if hasattr(quote_data, 'chg_type'):
+            quote_params['chg_type'] = int(quote_data.chg_type) if quote_data.chg_type is not None else 0
+            chg_type_desc = {1: "漲停", 2: "漲", 3: "平盤", 4: "跌", 5: "跌停"}.get(quote_params['chg_type'], "未知")
+            logger.info(f"漲跌註記 (chg_type): {quote_data.chg_type} ({chg_type_desc})")
+        
+        if hasattr(quote_data, 'price_chg'):
+            quote_params['price_chg'] = float(quote_data.price_chg) if quote_data.price_chg else 0
+            logger.info(f"漲跌價 (price_chg): {quote_data.price_chg}")
+        
+        if hasattr(quote_data, 'pct_chg'):
+            quote_params['pct_chg'] = float(quote_data.pct_chg) if quote_data.pct_chg else 0
+            logger.info(f"漲跌率 (pct_chg): {quote_data.pct_chg}%")
+        
+        # 委買委賣資訊 (Bid/Ask Information)
+        if hasattr(quote_data, 'bid_price'):
+            quote_params['bid_price'] = [float(p) for p in quote_data.bid_price] if quote_data.bid_price else []
+            logger.info(f"買價 (bid_price): {quote_data.bid_price}")
+        
+        if hasattr(quote_data, 'bid_volume'):
+            quote_params['bid_volume'] = [int(v) for v in quote_data.bid_volume] if quote_data.bid_volume else []
+            logger.info(f"買量 (bid_volume): {quote_data.bid_volume}")
+        
+        if hasattr(quote_data, 'ask_price'):
+            quote_params['ask_price'] = [float(p) for p in quote_data.ask_price] if quote_data.ask_price else []
+            logger.info(f"賣價 (ask_price): {quote_data.ask_price}")
+        
+        if hasattr(quote_data, 'ask_volume'):
+            quote_params['ask_volume'] = [int(v) for v in quote_data.ask_volume] if quote_data.ask_volume else []
+            logger.info(f"賣量 (ask_volume): {quote_data.ask_volume}")
+        
+        if hasattr(quote_data, 'diff_bid_vol'):
+            quote_params['diff_bid_vol'] = [int(v) for v in quote_data.diff_bid_vol] if quote_data.diff_bid_vol else []
+            logger.info(f"買價增減量 (diff_bid_vol): {quote_data.diff_bid_vol}")
+        
+        if hasattr(quote_data, 'diff_ask_vol'):
+            quote_params['diff_ask_vol'] = [int(v) for v in quote_data.diff_ask_vol] if quote_data.diff_ask_vol else []
+            logger.info(f"賣價增減量 (diff_ask_vol): {quote_data.diff_ask_vol}")
+        
+        # 盤後零股資訊 (After-hours Odd Lot Information)
+        if hasattr(quote_data, 'closing_oddlot_shares'):
+            quote_params['closing_oddlot_shares'] = int(quote_data.closing_oddlot_shares) if quote_data.closing_oddlot_shares else 0
+            logger.info(f"盤後零股成交股數 (closing_oddlot_shares): {quote_data.closing_oddlot_shares}")
+        
+        if hasattr(quote_data, 'closing_oddlot_close'):
+            quote_params['closing_oddlot_close'] = float(quote_data.closing_oddlot_close) if quote_data.closing_oddlot_close else 0
+            logger.info(f"盤後零股成交價 (closing_oddlot_close): {quote_data.closing_oddlot_close}")
+        
+        if hasattr(quote_data, 'closing_oddlot_amount'):
+            quote_params['closing_oddlot_amount'] = float(quote_data.closing_oddlot_amount) if quote_data.closing_oddlot_amount else 0
+            logger.info(f"盤後零股成交額 (closing_oddlot_amount): {quote_data.closing_oddlot_amount}")
+        
+        if hasattr(quote_data, 'closing_oddlot_bid_price'):
+            quote_params['closing_oddlot_bid_price'] = float(quote_data.closing_oddlot_bid_price) if quote_data.closing_oddlot_bid_price else 0
+            logger.info(f"盤後零股買價 (closing_oddlot_bid_price): {quote_data.closing_oddlot_bid_price}")
+        
+        if hasattr(quote_data, 'closing_oddlot_ask_price'):
+            quote_params['closing_oddlot_ask_price'] = float(quote_data.closing_oddlot_ask_price) if quote_data.closing_oddlot_ask_price else 0
+            logger.info(f"盤後零股賣價 (closing_oddlot_ask_price): {quote_data.closing_oddlot_ask_price}")
+        
+        # 定盤交易資訊 (Fixed Price Trading Information)
+        if hasattr(quote_data, 'fixed_trade_vol'):
+            quote_params['fixed_trade_vol'] = int(quote_data.fixed_trade_vol) if quote_data.fixed_trade_vol else 0
+            logger.info(f"定盤成交量 (fixed_trade_vol): {quote_data.fixed_trade_vol}")
+        
+        if hasattr(quote_data, 'fixed_trade_amount'):
+            quote_params['fixed_trade_amount'] = float(quote_data.fixed_trade_amount) if quote_data.fixed_trade_amount else 0
+            logger.info(f"定盤成交額 (fixed_trade_amount): {quote_data.fixed_trade_amount}")
+        
+        # 其他資訊 (Other Information)
+        if hasattr(quote_data, 'avail_borrowing'):
+            quote_params['avail_borrowing'] = int(quote_data.avail_borrowing) if quote_data.avail_borrowing else 0
+            logger.info(f"借券可用餘額 (avail_borrowing): {quote_data.avail_borrowing}")
+        
+        if hasattr(quote_data, 'suspend'):
+            quote_params['suspend'] = bool(quote_data.suspend) if quote_data.suspend is not None else False
+            logger.info(f"暫停交易 (suspend): {quote_data.suspend}")
+        
+        if hasattr(quote_data, 'simtrade'):
+            quote_params['simtrade'] = bool(quote_data.simtrade) if quote_data.simtrade is not None else False
+            logger.info(f"試撮 (simtrade): {quote_data.simtrade}")
+        
+        if hasattr(quote_data, 'intraday_odd'):
+            quote_params['intraday_odd'] = int(quote_data.intraday_odd) if quote_data.intraday_odd is not None else 0
+            intraday_odd_desc = {0: "整股", 1: "盤中零股"}.get(quote_params['intraday_odd'], "未知")
+            logger.info(f"盤中零股 (intraday_odd): {quote_data.intraday_odd} ({intraday_odd_desc})")
+        
+        logger.info("=== 即時行情查詢完成 ===")
+        
+        # Return comprehensive response
+        return {
+            "success": True,
+            "data_source": data_source,
+            "stock_info": {
+                "code": stock_code,
+                "name": contract.name,
+                "exchange": str(contract.exchange) if hasattr(contract, 'exchange') else "unknown"
+            },
+            "quote_data": quote_params,
+            "parameter_descriptions": {
+                "code": "商品代碼",
+                "datetime": "時間",
+                "open": "開盤價",
+                "close": "成交價",
+                "high": "最高價(自開盤)",
+                "low": "最低價(自開盤)",
+                "avg_price": "均價",
+                "volume": "成交量",
+                "total_volume": "總成交量",
+                "amount": "成交額 (NTD)",
+                "total_amount": "總成交額 (NTD)",
+                "tick_type": "內外盤別 {1: 外盤, 2: 內盤, 0: 無法判定}",
+                "chg_type": "漲跌註記 {1: 漲停, 2: 漲, 3: 平盤, 4: 跌, 5: 跌停}",
+                "price_chg": "漲跌價",
+                "pct_chg": "漲跌率",
+                "bid_side_total_vol": "買盤成交總量 (張)",
+                "ask_side_total_vol": "賣盤成交總量 (張)",
+                "bid_side_total_cnt": "買盤成交筆數",
+                "ask_side_total_cnt": "賣盤成交筆數",
+                "bid_price": "買價",
+                "bid_volume": "買量",
+                "diff_bid_vol": "買價增減量",
+                "ask_price": "賣價",
+                "ask_volume": "賣量",
+                "diff_ask_vol": "賣價增減量",
+                "closing_oddlot_shares": "盤後零股成交股數",
+                "closing_oddlot_close": "盤後零股成交價",
+                "closing_oddlot_amount": "盤後零股成交額",
+                "closing_oddlot_bid_price": "盤後零股買價",
+                "closing_oddlot_ask_price": "盤後零股賣價",
+                "fixed_trade_vol": "定盤成交量 (張)",
+                "fixed_trade_amount": "定盤成交額",
+                "avail_borrowing": "借券可用餘額",
+                "suspend": "暫停交易",
+                "simtrade": "試撮",
+                "intraday_odd": "盤中零股 {0: 整股, 1: 盤中零股}"
+            },
+            "timestamp": datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            "timezone": "Asia/Taipei (+8)"
+        }
+        
+    except Exception as e:
+        logger.error(f"Get realtime quote error: {e}")
+        return {"success": False, "message": f"Error: {str(e)}"}
+
 @app.get("/technical/{stock_codes}")
 async def get_technical_indicators(stock_codes: str, timeframe: str = "daily", session: str = "morning", date: str = None):
     """Get technical indicators for multiple stocks and timeframes with session control and date selection
@@ -796,8 +1072,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         
                         if not interval_ticks.empty:
                             if 'tick_type' in interval_ticks.columns:
-                                # Use tick_type for actual executed volume classification
-                                # tick_type: 1=外盤(買進), 2=內盤(賣出), 0=無法判定
                                 buy_ticks = interval_ticks[interval_ticks['tick_type'] == 1]
                                 sell_ticks = interval_ticks[interval_ticks['tick_type'] == 2]
                                 neutral_ticks = interval_ticks[interval_ticks['tick_type'] == 0]
@@ -806,36 +1080,36 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
                                 neutral_volume = int(neutral_ticks['volume'].sum()) if not neutral_ticks.empty else 0
                                 
-                                # Distribute neutral volume proportionally
-                                if neutral_volume > 0 and (buy_volume + sell_volume) > 0:
-                                    total_classified = buy_volume + sell_volume
-                                    buy_ratio = buy_volume / total_classified
-                                    sell_ratio = sell_volume / total_classified
-                                    
-                                    buy_volume += int(neutral_volume * buy_ratio)
-                                    sell_volume += int(neutral_volume * sell_ratio)
-                                elif neutral_volume > 0:
-                                    # If no classified volume, split neutral 50/50
-                                    buy_volume = neutral_volume // 2
-                                    sell_volume = neutral_volume - buy_volume
+                                logger.info(f"5min interval {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume}, neutral={neutral_volume}, total_ticks={len(interval_ticks)}")
+                                
+                                # Distribute neutral volume 50/50 instead of proportionally
+                                if neutral_volume > 0:
+                                    buy_volume += neutral_volume // 2
+                                    sell_volume += neutral_volume - (neutral_volume // 2)
                                 
                             else:
-                                # Fallback: Use price comparison for buy/sell classification
-                                interval_avg = (open_price + close_price) / 2
+                                interval_avg = (open_price + high_price + low_price + close_price) / 4
                                 buy_ticks = interval_ticks[interval_ticks['close'] >= interval_avg]
                                 sell_ticks = interval_ticks[interval_ticks['close'] < interval_avg]
                                 
                                 buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
                                 sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                                
+                                logger.info(f"5min interval {row['ts'].strftime('%H:%M')} (fallback): buy={buy_volume}, sell={sell_volume}")
                             
-                            # Ensure buy + sell doesn't exceed K-bar volume
                             total_tick_volume = buy_volume + sell_volume
-                            if total_tick_volume > volume and total_tick_volume > 0:
+                            if total_tick_volume > volume and volume > 0:
                                 # Proportionally adjust if tick volume exceeds K-bar volume
                                 ratio = volume / total_tick_volume
                                 buy_volume = int(buy_volume * ratio)
                                 sell_volume = int(sell_volume * ratio)
-                    
+                                logger.info(f"Adjusted volumes for {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume} (ratio={ratio:.2f})")
+                            elif total_tick_volume == 0 and volume > 0:
+                                # If no tick data, estimate 50/50
+                                buy_volume = volume // 2
+                                sell_volume = volume - buy_volume
+                                logger.info(f"Estimated 50/50 for {row['ts'].strftime('%H:%M')}: buy={buy_volume}, sell={sell_volume}")
+
                     bar_data = {
                         "time": row['ts'].strftime('%H:%M'),
                         "open": open_price,
@@ -1008,6 +1282,74 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     else:
                         bb_signal = "normal"
                 
+                daily_buy_volume = None
+                daily_sell_volume = None
+                
+                # Try to get tick data for buy/sell volume analysis
+                try:
+                    if target_date:
+                        tick_date = target_date
+                    else:
+                        tick_date = now_tw.date()
+                    
+                    ticks = api.ticks(
+                        contract=contract,
+                        date=tick_date.strftime('%Y-%m-%d')
+                    )
+                    
+                    if ticks and hasattr(ticks, 'ts') and ticks.ts:
+                        tick_data = {
+                            'ts': ticks.ts, 
+                            'close': ticks.close, 
+                            'volume': ticks.volume
+                        }
+                        
+                        if hasattr(ticks, 'tick_type') and ticks.tick_type:
+                            tick_data['tick_type'] = ticks.tick_type
+                        
+                        tick_df = pd.DataFrame(tick_data)
+                        tick_df['ts'] = pd.to_datetime(tick_df['ts'], utc=True).dt.tz_convert(TW_TZ)
+                        
+                        logger.info(f"Daily tick data shape: {tick_df.shape}")
+                        
+                        if 'tick_type' in tick_df.columns:
+                            # Calculate daily buy/sell volume using tick_type
+                            buy_ticks = tick_df[tick_df['tick_type'] == 1]  # 外盤
+                            sell_ticks = tick_df[tick_df['tick_type'] == 2]  # 內盤
+                            neutral_ticks = tick_df[tick_df['tick_type'] == 0]  # 無法判定
+                            
+                            daily_buy_volume = int(buy_ticks['volume'].sum()) if not buy_ticks.empty else 0
+                            daily_sell_volume = int(sell_ticks['volume'].sum()) if not sell_ticks.empty else 0
+                            neutral_volume = int(neutral_ticks['volume'].sum()) if not neutral_ticks.empty else 0
+                            
+                            # Distribute neutral volume 50/50
+                            if neutral_volume > 0:
+                                daily_buy_volume += neutral_volume // 2
+                                daily_sell_volume += neutral_volume - (neutral_volume // 2)
+                                
+                            logger.info(f"Daily buy/sell volume calculated: buy={daily_buy_volume}, sell={daily_sell_volume}")
+                        else:
+                            # Fallback: estimate buy/sell based on price movement
+                            if len(close_prices) >= 2:
+                                price_up_volume = 0
+                                price_down_volume = 0
+                                
+                                for i in range(1, len(close_prices)):
+                                    if close_prices[i] > close_prices[i-1]:
+                                        price_up_volume += volumes[i]
+                                    elif close_prices[i] < close_prices[i-1]:
+                                        price_down_volume += volumes[i]
+                                
+                                daily_buy_volume = price_up_volume
+                                daily_sell_volume = price_down_volume
+                                
+                                logger.info(f"Daily buy/sell volume estimated from price: buy={daily_buy_volume}, sell={daily_sell_volume}")
+                        
+                except Exception as tick_error:
+                    logger.error(f"Daily tick data error for {stock_code}: {tick_error}")
+                    daily_buy_volume = None
+                    daily_sell_volume = None
+
                 return {
                     "success": True,
                     "query_date": base_date.strftime('%Y-%m-%d'),
@@ -1027,7 +1369,10 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                         "current_volume": current_volume,
                         "avg_volume_5d": round(avg_volume_5d, 0) if avg_volume_5d else None,
                         "avg_volume_20d": round(avg_volume_20d, 0) if avg_volume_20d else None,
-                        "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None
+                        "volume_ratio_5d": round(current_volume / avg_volume_5d, 2) if avg_volume_5d and avg_volume_5d > 0 else None,
+                        "daily_buy_volume": daily_buy_volume,
+                        "daily_sell_volume": daily_sell_volume,
+                        "buy_sell_ratio": round(daily_buy_volume / daily_sell_volume, 2) if daily_buy_volume and daily_sell_volume and daily_sell_volume > 0 else None
                     },
                     "signals": {
                         "trend": trend_signal,
@@ -1037,14 +1382,6 @@ async def get_single_stock_technical(stock_code: str, contract, timeframe: str, 
                     "last_update": df.iloc[-1]['ts'].strftime('%Y-%m-%d %H:%M:%S') if not df.empty else None,
                     "timezone": "Asia/Taipei (+8)"
                 }
-                
-            except Exception as df_error:
-                logger.error(f"Error converting daily kbars to DataFrame for {stock_code} on {base_date}: {df_error}")
-                return {"success": False, "message": f"Data processing error: {str(df_error)}"}
-            
-        except Exception as e:
-            logger.error(f"Error getting daily data for {stock_code} on {base_date}: {e}")
-            return {"success": False, "message": f"Daily data error: {str(e)}"}
 
     logger.info(f"=== RAW DATA LOGGING END for {stock_code} ===")
 
