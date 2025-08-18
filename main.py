@@ -8,6 +8,82 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytz
 import traceback
+import time
+
+
+# 全域變數來追蹤登入時間和 token 狀態
+last_login_time = None
+TOKEN_LIFETIME_HOURS = 23  # 保守設定，token 實際是 24 小時，我們提前更新
+
+def check_token_expiry():
+    """檢查 token 是否即將過期"""
+    global last_login_time
+    
+    if last_login_time is None:
+        logger.info("No login record found, need to login")
+        return True  # 需要登入
+    
+    time_since_login = datetime.now() - last_login_time
+    hours_since_login = time_since_login.total_seconds() / 3600
+    
+    if hours_since_login > TOKEN_LIFETIME_HOURS:
+        logger.info(f"⏰ Token likely expired (logged in {hours_since_login:.1f} hours ago)")
+        return True
+    
+    logger.info(f"✅ Token still valid ({hours_since_login:.1f} hours since login)")
+    return False
+
+def force_relogin():
+    """強制重新登入"""
+    global api, login_status, last_login_time
+    
+    logger.info("🔄 Forcing re-login due to token expiration or connection failure...")
+    
+    # 先嘗試登出（清理舊連線）
+    try:
+        if api:
+            api.logout()
+    except:
+        pass
+    
+    # 重新初始化 API
+    api = sj.Shioaji()
+    
+    api_key = os.getenv("SHIOAJI_API_KEY")
+    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+    
+    if not api_key or not secret_key:
+        logger.error("❌ Environment variables not set")
+        return False
+    
+    try:
+        api_key_clean = api_key.strip().strip('"').strip("'")
+        secret_key_clean = secret_key.strip().strip('"').strip("'")
+        
+        accounts = api.login(
+            api_key=api_key_clean,
+            secret_key=secret_key_clean,
+            fetch_contract=True,
+            subscribe_trade=True
+        )
+        
+        if accounts:
+            login_status = True
+            last_login_time = datetime.now()
+            logger.info(f"✅ Re-login successful at {last_login_time}")
+            logger.info(f"   Accounts: {[acc.account_id for acc in accounts]}")
+            return True
+        else:
+            login_status = False
+            logger.error("❌ Re-login failed: no accounts returned")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Re-login error: {e}")
+        login_status = False
+        return False
+
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -68,7 +144,7 @@ class QuoteResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global api, login_status
+    global api, login_status, last_login_time  # 加入 last_login_time
     try:
         api = sj.Shioaji()
         logger.info("Shioaji API initialized")
@@ -81,6 +157,8 @@ async def startup_event():
         logger.info(f"SHIOAJI_API_KEY: {'SET' if api_key else 'NOT SET'}")
         logger.info(f"SHIOAJI_SECRET_KEY: {'SET' if secret_key else 'NOT SET'}")
         logger.info(f"SHIOAJI_PERSON_ID: {'SET' if os.getenv('SHIOAJI_PERSON_ID') else 'NOT SET'}")
+
+    
         
         if api_key and secret_key:
             logger.info(f"API Key length: {len(api_key)}")
@@ -124,6 +202,7 @@ async def startup_event():
                         
                         if accounts:
                             login_status = True
+                            last_login_time = datetime.now()  # 加入這行
                             login_successful = True
                             logger.info(f"Auto-login successful with method: {method}")
                             logger.info(f"Connected accounts: {[acc.account_id for acc in accounts]}")
@@ -147,11 +226,15 @@ async def startup_event():
         else:
             login_status = False
             logger.warning("Auto-login skipped: Missing environment variables")
-            
+
+
+
     except Exception as e:
         logger.error(f"Startup error: {e}")
         api = None
         login_status = False
+
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -193,7 +276,7 @@ async def root():
 @app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
     """Manual login to Shioaji API (optional if auto-login is configured)"""
-    global api, login_status
+    global api, login_status, last_login_time  # 需要加入 last_login_time
     try:
         if not api:
             api = sj.Shioaji()
@@ -207,6 +290,7 @@ async def login(request: LoginRequest):
         
         if accounts:
             login_status = True
+            last_login_time = datetime.now()  # 加入這行
             account_info = {
                 "accounts": [
                     {
@@ -275,46 +359,34 @@ def check_connection():
         return False
 
 def ensure_login():
-    """Ensure we're logged in, attempt login if not"""
-    global api, login_status
+    """確保已登入，必要時重新登入"""
+    global api, login_status, last_login_time
     
-    # First check if we're already connected
-    if check_connection():
-        return True
+    # 1. 檢查 token 是否過期
+    if check_token_expiry():
+        logger.info("🔄 Token expired or no login record, forcing re-login...")
+        return force_relogin()
     
-    # Try to login using environment variables
-    api_key = os.getenv("SHIOAJI_API_KEY")
-    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-    
-    if not api_key or not secret_key:
-        return False
-    
+    # 2. 檢查連線是否正常
     try:
         if not api:
-            api = sj.Shioaji()
+            logger.info("🔄 API not initialized, forcing login...")
+            return force_relogin()
         
-        api_key_clean = api_key.strip().strip('"').strip("'")
-        secret_key_clean = secret_key.strip().strip('"').strip("'")
-        
-        accounts = api.login(
-            api_key=api_key_clean,
-            secret_key=secret_key_clean,
-            fetch_contract=True,
-            subscribe_trade=True
-        )
-        
+        # 嘗試一個簡單的 API 呼叫來測試連線
+        accounts = api.list_accounts()
         if accounts:
-            login_status = True
-            logger.info("Login successful via ensure_login")
             return True
         else:
-            login_status = False
-            return False
+            logger.warning("⚠️ No accounts returned, forcing re-login...")
+            return force_relogin()
             
     except Exception as e:
-        logger.warning(f"ensure_login failed: {e}")
-        login_status = False
-        return False
+        # 任何錯誤都視為需要重新登入
+        logger.warning(f"⚠️ Connection test failed: {e}")
+        logger.info("🔄 Forcing re-login due to connection failure...")
+        return force_relogin()
+
 
 @app.get("/accounts")
 async def get_accounts():
@@ -2104,7 +2176,7 @@ async def compare_stocks_performance(
 @app.post("/retry-login")
 async def retry_auto_login():
     """Retry auto-login using environment variables"""
-    global api, login_status
+    global api, login_status, last_login_time  # 加入 last_login_time
     try:
         if not api:
             api = sj.Shioaji()
@@ -2150,6 +2222,7 @@ async def retry_auto_login():
                 
                 if accounts:
                     login_status = True
+                    last_login_time = datetime.now()  # 加入這行
                     return {
                         "success": True,
                         "message": f"Auto-login retry successful with method: {method}",
